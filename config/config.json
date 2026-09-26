@@ -1,0 +1,10 @@
+{
+  "port": 8787,
+  "strategy": "round_robin_key_then_model",
+  "state_file": "./data/state.json",
+  "log_level": "info",
+  "request_timeout_ms": 60000,
+  "max_fallback_attempts": 12,
+  "respect_agent_model": false,
+  "default_cooldown_seconds": 30
+}

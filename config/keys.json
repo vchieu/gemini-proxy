@@ -1,0 +1,6 @@
+{
+  "keys": [
+    { "id": "key-1", "api_key": "PASTE_REAL_KEY_HERE_1", "enabled": true },
+    { "id": "key-2", "api_key": "PASTE_REAL_KEY_HERE_2", "enabled": true }
+  ]
+}

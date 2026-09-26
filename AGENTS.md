@@ -1,0 +1,118 @@
+# AGENTS.md — Hướng dẫn bắt buộc cho AI agent làm việc trong repo này
+
+> **Mọi AI agent (và cả contributor người) PHẢI đọc file này trước khi sửa code.**
+> File này là source-of-truth về kiến trúc, contract module và quy trình làm việc.
+> Spec sản phẩm gốc: `gemini-proxy-plan.md`.
+
+## 1. Thứ tự đọc bắt buộc (reference order)
+
+Trước khi nhận task, đọc theo thứ tự:
+
+1. `AGENTS.md` (file này) — nắm luật và kiến trúc.
+2. `gemini-proxy-plan.md` — spec đầy đủ (§5 skeleton/signature, §6 thuật toán, §10 edge cases).
+3. `types.js` — các typedef dùng chung (`ApiKeyConfig`, `ModelConfig`, `ModelLimits`, `PairState`, `SelectedPair`).
+4. Module liên quan trực tiếp tới task (xem bảng §3).
+5. `config/keys.json`, `config/models.json`, `config/config.json` — nếu task đụng tới config/quota.
+6. `tests/` — test tương ứng để biết hành vi kỳ vọng đã được khóa (lock) ở đâu.
+
+Không được suy đoán signature từ trí nhớ — luôn mở file nguồn để kiểm chứng.
+
+## 2. Tổng quan kiến trúc
+
+Proxy HTTP local (Node.js + Express, CommonJS), đứng giữa agent (Cline/OpenCode)
+và Google Gemini API. Nhận request OpenAI-compatible, tự xoay cặp `(key, model)`
+khi gặp 429 — agent không biết phía sau có fallback.
+
+Luồng 1 request (`POST /v1/chat/completions`, non-stream):
+
+```
+agent → api/server.js → router/fallbackLoop.js → router/selector.js
+  → state/cooldown.js (isAvailable) + state/store.js (StateStore)
+  → client/geminiClient.js → Google API
+  → 429? client/errorParser.js → store.setCooldown → chọn cặp khác (loop)
+  → thành công? store.recordSuccess → api/translate.js → trả OpenAI format
+```
+
+Bản dịch format nằm ở `api/translate.js` (`openAiToGemini`, `geminiToOpenAi`,
+`geminiChunkToOpenAiChunk`). Quota ngày reset theo **nửa đêm Pacific Time**
+(`utils/time.js` → `nextMidnightPacific`), KHÔNG dùng giờ server.
+
+## 3. Contract module (không được tự ý đổi)
+
+| Module | File | Export chính / signature |
+|---|---|---|
+| Bootstrap | `index.js` | `main()` — load config → `StateStore` → `createServer` → `listen` |
+| Config Loader | `config/loader.js` | `loadConfig(configDir) → { keys, models, settings }` |
+| State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()`, `minCooldownRemaining(now)`, `snapshot()` |
+| Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` |
+| Selector | `router/selector.js` | `selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePairs) → SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
+| Fallback | `router/fallbackLoop.js` | `handleRequest(agentRequest, { models, keys, stateStore, geminiClient, config }) → Promise<{ openAiResponse, usedKeyId, usedModel, attempts }>`; `class Aggregated429Error` |
+| Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)`; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
+| Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
+| API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app` |
+| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, model, streamId, created)` |
+| Token estimate | `utils/tokenEstimate.js` | `estimateTokens(messages) → number` (heuristic chars/4 + 4 token overhead/message) |
+| Time | `utils/time.js` | `nextMidnightPacific(nowMs) → ms` |
+| Logger | `utils/logger.js` | `logger.{debug,info,warn,error}`, `createLogger(level)` |
+
+Quy tắc:
+
+- **Không đổi tên file, tên hàm, tham số, kiểu trả về** nếu không có yêu cầu rõ ràng và không cập nhật toàn bộ caller + test + docs (xem §5).
+- Codebase dùng **CommonJS** (`require`/`module.exports`), Node `>= 18` (dùng `fetch` global). Không thêm dependency mới nếu stdlib giải quyết được.
+- `state/store.js` là single-process in-memory + persist JSON. Mọi mutation quota/cooldown phải đi qua `StateStore` để được `persist()`.
+- Không bao giờ commit API key thật. `config/keys.json` chỉ chứa placeholder.
+
+## 4. Quy trình làm việc chuẩn
+
+1. Đọc AGENTS.md + file liên quan (xem §1).
+2. Chạy test baseline trước khi sửa: `node --test tests/*.test.js` (hoặc `npm test`, tương đương).
+3. Sửa code theo đúng contract §3 và thuật toán `gemini-proxy-plan.md` §6.
+4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`22/22` tại thời điểm viết file này).
+5. Smoke-test server nếu đụng tới `api/`, `index.js`, `config/`: `node index.js` rồi kiểm tra
+   `GET /health`, `GET /v1/models`, `GET /admin/status`, `POST /v1/chat/completions` (case thiếu `messages` phải 400).
+6. Cập nhật tài liệu theo §5 **trong cùng một change** — PR/change thiếu doc update được coi là chưa xong.
+
+## 5. ⛔ RULE NGHIÊM NGẶT: update documents khi update source
+
+> **Bất kỳ thay đổi source nào làm tài liệu hiện tại trở nên sai/lạc hậu thì BẮT BUỘC
+> phải cập nhật tài liệu trong cùng một lần thay đổi. Không được tách "code trước,
+> docs sau".**
+
+### 5.1 Khi nào phải update docs
+
+| Thay đổi source | Docs phải update |
+|---|---|
+| Thêm/đổi/xóa endpoint, field request/response, status code | `README.md` (§Endpoint) + `AGENTS.md` §3 nếu đổi contract |
+| Thêm/đổi/xóa field config (`keys.json`/`models.json`/`config.json`), đổi default, đổi validation | `README.md` (§Cấu hình) + `AGENTS.md` §3 |
+| Đổi signature/hành vi hàm trong contract §3, đổi thuật toán chọn cặp/cooldown/fallback | `AGENTS.md` §3 (+ `gemini-proxy-plan.md` nếu đổi thiết kế gốc — ghi rõ lý do lệch spec) |
+| Đổi thuật toán quota (RPM/RPD/TPM), timezone reset, công thức estimate token | `AGENTS.md` §2–§3 + `README.md` nếu user-visible |
+| Thêm dependency, đổi yêu cầu Node, đổi script `npm` | `README.md` + `AGENTS.md` §3–§4 |
+| Thêm/xóa test làm thay đổi số lượng test kỳ vọng | Cập nhật con số trong `AGENTS.md` §4 |
+
+### 5.2 Checklist trước khi kết thúc task (bắt buộc tự kiểm)
+
+- [ ] `README.md` còn mô tả đúng endpoint/config/cách chạy không?
+- [ ] Bảng contract `AGENTS.md` §3 còn khớp signature thực tế không?
+- [ ] Con số test kỳ vọng (§4) còn đúng không?
+- [ ] Nếu cố tình lệch khỏi `gemini-proxy-plan.md`, đã ghi lý do ở đâu?
+- [ ] Đã chạy full test suite và ghi kết quả vào báo cáo chưa?
+
+Nếu câu trả lời cho bất kỳ thay đổi user-visible/contract nào là "docs chưa cần update",
+phải nêu rõ lý do trong báo cáo thay vì im lặng bỏ qua.
+
+## 6. Edge cases không được quên (§10 của plan)
+
+1. Tất cả cặp cooldown → 429 tổng hợp + header `Retry-After` = cooldown ngắn nhất.
+2. Request ước lượng vượt TPM mọi model → lỗi rõ ràng, không loop vô hạn.
+3. Single-process: mutation state qua `StateStore` (đồng bộ); không cache `PairState` ra biến ngoài rồi ghi đè.
+4. Reset ngày theo PT (`utils/time.js`), không dùng giờ local.
+5. Lỗi non-429 (network/5xx) → trả lỗi ngay, không tính quota, không set cooldown.
+6. `respect_agent_model=true` mới tôn trọng model agent gửi; mặc định `false` (proxy tự chọn, `model: "auto"`).
+7. Streaming: kiểm tra limit **trước** khi mở stream; 429 giữa stream thì đóng stream kèm lỗi (không retry ngầm).
+
+## 7. Cấm kỵ
+
+- Không hardcode API key, không log nguyên `api_key` (chỉ log `key.id`).
+- Không `require` vòng tròn giữa `api/` ↔ `router/` ↔ `client/` (luồng phụ thuộc một chiều như §2).
+- Không sửa `config/*.json` mẫu thành key thật để "test cho tiện".
+- Không dùng `tail`, `ls -la`, `cat` qua shell khi đã có tool đọc file chuyên dụng.

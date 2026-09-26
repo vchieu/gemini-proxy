@@ -1,0 +1,19 @@
+{
+  "models": [
+    {
+      "name": "gemini-2.5-flash",
+      "priority": 1,
+      "limits": { "rpm": 5, "rpd": 20, "tpm": 250000 }
+    },
+    {
+      "name": "gemini-2.5-flash-lite",
+      "priority": 2,
+      "limits": { "rpm": 15, "rpd": 200, "tpm": 250000 }
+    },
+    {
+      "name": "gemini-2.0-flash",
+      "priority": 3,
+      "limits": { "rpm": 10, "rpd": 200, "tpm": 1000000 }
+    }
+  ]
+}
