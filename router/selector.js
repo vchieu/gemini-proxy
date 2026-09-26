@@ -43,4 +43,17 @@ function selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePai
   return null;
 }
 
-module.exports = { selectPair, _resetRoundRobin };
+/**
+ * Chọn cặp khả dụng rồi GIỮ CHỖ ngay (đồng bộ, không await ở giữa) để các
+ * request đồng thời không cùng chọn 1 cặp (edge case #3 — plan §10.3).
+ * Caller BẮT BUỘC gọi `stateStore.release(key.id, model.name, estimatedTokens)`
+ * trong mọi nhánh kết thúc (thành công / 429 / lỗi khác).
+ * @returns {SelectedPair | null} null nếu không còn cặp khả dụng
+ */
+function selectAndReserve(models, keys, stateStore, nowMs, estimatedTokens, excludePairs) {
+  const pair = selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePairs);
+  if (pair) stateStore.reserve(pair.key.id, pair.model.name, estimatedTokens);
+  return pair;
+}
+
+module.exports = { selectPair, selectAndReserve, _resetRoundRobin };

@@ -14,20 +14,21 @@ function isAvailable(pairState, limits, nowMs, estimatedTokens) {
 
   if ((pairState.cooldown_until || 0) > now) return false;
 
-  // RPD: reset theo ngày PT
+  // RPD: reset theo ngày PT. Cộng inflight để burst đồng thời không vượt RPD.
   if (now >= (pairState.daily_reset_at || 0)) {
     pairState.daily_count = 0;
     pairState.daily_reset_at = nextMidnightPacific(now);
   }
-  if ((pairState.daily_count || 0) >= limits.rpd) return false;
+  if ((pairState.daily_count || 0) + (pairState.inflight_count || 0) >= limits.rpd) return false;
 
-  // RPM: sliding window 60s (không mutate mảng gốc quá mức cần thiết)
+  // RPM: sliding window 60s (không mutate mảng gốc quá mức cần thiết).
+  // Cộng inflight: request đã giữ chỗ nhưng chưa recordSuccess vẫn chiếm slot.
   const cutoff = now - 60000;
   let recentRequests = 0;
   if (Array.isArray(pairState.request_timestamps)) {
     for (const ts of pairState.request_timestamps) if (ts > cutoff) recentRequests++;
   }
-  if (recentRequests >= limits.rpm) return false;
+  if (recentRequests + (pairState.inflight_count || 0) >= limits.rpm) return false;
 
   // TPM: sliding window 60s
   let recentTokens = 0;
@@ -36,7 +37,7 @@ function isAvailable(pairState, limits, nowMs, estimatedTokens) {
       if (Array.isArray(e) && e[0] > cutoff) recentTokens += Number(e[1]) || 0;
     }
   }
-  if (recentTokens + est > limits.tpm) return false;
+  if (recentTokens + (pairState.inflight_tokens || 0) + est > limits.tpm) return false;
 
   return true;
 }

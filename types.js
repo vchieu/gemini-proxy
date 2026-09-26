@@ -26,6 +26,8 @@
  * @property {number} daily_reset_at
  * @property {[number, number][]} token_timestamps
  * @property {number} cooldown_until
+ * @property {number} [inflight_count]   // transient: request đang bay giữ chỗ (không persist)
+ * @property {number} [inflight_tokens]  // transient: token ước lượng của request đang bay
  */
 
 /**

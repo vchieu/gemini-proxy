@@ -38,9 +38,10 @@ describe('nextMidnightPacific', () => {
     const now = Date.UTC(2026, 0, 15, 12, 0, 0);
     const next = nextMidnightPacific(now);
     assert.ok(next > now);
-    // verify: next formatted in PT is 00:00:00
+    // verify: next formatted in PT is 00:00:00 (ICU có thể trả hour "0" hoặc "24")
     const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false });
     const parts = Object.fromEntries(fmt.formatToParts(new Date(next)).map((p) => [p.type, p.value]));
-    assert.equal(`${parts.hour}:${parts.minute}:${parts.second}`, '24:00:00'.replace('24', '0').replace('0:00:00', '00:00:00') === '00:00:00' ? '00:00:00' : `${parts.hour}:${parts.minute}:${parts.second}`);
+    const hour = parts.hour === '24' ? '00' : parts.hour.padStart(2, '0');
+    assert.equal(`${hour}:${parts.minute}:${parts.second}`, '00:00:00');
   });
 });

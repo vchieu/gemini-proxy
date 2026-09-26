@@ -9,6 +9,10 @@ function blankPairState(nowMs) {
     daily_reset_at: nextMidnightPacific(nowMs !== undefined ? nowMs : Date.now()),
     token_timestamps: [],
     cooldown_until: 0,
+    // Transient, KHÔNG persist (xem persist()): giữ chỗ cho request đang bay
+    // để các request đồng thời không cùng thấy 1 slot còn trống (edge case #3).
+    inflight_count: 0,
+    inflight_tokens: 0,
   };
 }
 
@@ -32,6 +36,9 @@ class StateStore {
             daily_reset_at: Number(v.daily_reset_at) || nextMidnightPacific(Date.now()),
             token_timestamps: Array.isArray(v.token_timestamps) ? v.token_timestamps : [],
             cooldown_until: Number(v.cooldown_until) || 0,
+            // inflight là transient của process cũ -> luôn reset về 0 khi load
+            inflight_count: 0,
+            inflight_tokens: 0,
           });
         }
       } catch (e) {
@@ -86,6 +93,27 @@ class StateStore {
     return st;
   }
 
+  /**
+   * Giữ chỗ cho 1 request sắp bay: tăng bộ đếm inflight để các request đồng thời
+   * khác thấy slot đã có chủ (edge case #3). Phải gọi reserve NGAY khi select
+   * (đồng bộ, không await ở giữa) và gọi release() khi request kết thúc.
+   * Cố ý KHÔNG persist: inflight là transient của process hiện tại.
+   */
+  reserve(keyId, modelName, estimatedTokens) {
+    const st = this.get(keyId, modelName);
+    st.inflight_count = (Number(st.inflight_count) || 0) + 1;
+    st.inflight_tokens = (Number(st.inflight_tokens) || 0) + (Number(estimatedTokens) || 0);
+    return st;
+  }
+
+  /** Trả chỗ đã giữ bằng reserve(). Luôn gọi trong mọi nhánh kết thúc request. */
+  release(keyId, modelName, estimatedTokens) {
+    const st = this.get(keyId, modelName);
+    st.inflight_count = Math.max(0, (Number(st.inflight_count) || 0) - 1);
+    st.inflight_tokens = Math.max(0, (Number(st.inflight_tokens) || 0) - (Number(estimatedTokens) || 0));
+    return st;
+  }
+
   /** Dọn các timestamp cũ hơn 60s khỏi mảng (gọi trước khi tính RPM/TPM) */
   pruneOldEntries(pairState, nowMs) {
     const cutoff = nowMs - 60000;
@@ -104,13 +132,19 @@ class StateStore {
     return pairState;
   }
 
-  /** Lưu toàn bộ state ra file (JSON.stringify) */
+  /** Lưu toàn bộ state ra file (JSON.stringify). Inflight bị lược bỏ vì là transient. */
   persist() {
     if (!this.statePath) return;
     try {
       const dir = path.dirname(this.statePath);
       if (dir && dir !== '.' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const pairs = Object.fromEntries(this.map.entries());
+      const pairs = {};
+      for (const [k, st] of this.map.entries()) {
+        const { inflight_count, inflight_tokens, ...durable } = st;
+        void inflight_count;
+        void inflight_tokens;
+        pairs[k] = durable;
+      }
       fs.writeFileSync(this.statePath, JSON.stringify({ pairs }, null, 2), 'utf8');
     } catch (e) {
       console.warn(`[StateStore] persist failed: ${e.message}`);

@@ -1,6 +1,6 @@
 const express = require('express');
 const { handleRequest, Aggregated429Error } = require('../router/fallbackLoop');
-const { selectPair } = require('../router/selector');
+const { selectAndReserve } = require('../router/selector');
 const { openAiToGemini, geminiChunkToOpenAiChunk } = require('./translate');
 const { estimateTokens } = require('../utils/tokenEstimate');
 const { extractRetryDelaySeconds } = require('../client/errorParser');
@@ -85,6 +85,8 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     }
 
     // ---- streaming: kiểm tra rate-limit TRƯỚC khi stream (edge case 7) ----
+    // releaseStreamSlot: trả chỗ đã giữ nếu có lỗi xảy ra ngoài các nhánh trong.
+    let releaseStreamSlot = null;
     try {
       let candidateModels = models;
       if (config.respect_agent_model && agentRequest.model && agentRequest.model !== 'auto') {
@@ -92,11 +94,20 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         if (found.length > 0) candidateModels = found;
       }
       const estimated = estimateTokens(agentRequest.messages);
-      const pair = selectPair(candidateModels, keys, stateStore, Date.now(), estimated, []);
+      const pair = selectAndReserve(candidateModels, keys, stateStore, Date.now(), estimated, []);
       if (!pair) {
         res.set('Retry-After', String(config.default_cooldown_seconds || 30));
         return res.status(429).json(errorToOpenAi(429, 'Tất cả model/key đều đang bị giới hạn'));
       }
+      // Mọi đường thoát phía dưới phải release chỗ đã giữ.
+      let released = false;
+      const releaseOnce = () => {
+        if (!released) {
+          released = true;
+          stateStore.release(pair.key.id, pair.model.name, estimated);
+        }
+      };
+      releaseStreamSlot = releaseOnce;
       const geminiBody = openAiToGemini(agentRequest);
       logger.info(`Stream start: key=${pair.key.id} model=${pair.model.name}`);
 
@@ -118,6 +129,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       } catch (e) {
         if (e instanceof Gemini429Error || e.status === 429) {
           const retrySeconds = e.retryDelaySeconds || extractRetryDelaySeconds({ error: { message: e.message } });
+          releaseOnce();
           stateStore.setCooldown(pair.key.id, pair.model.name, Date.now() + retrySeconds * 1000 + 500);
           if (!res.headersSent) {
             res.set('Retry-After', String(Math.ceil(retrySeconds)));
@@ -126,6 +138,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
           res.write(`data: ${JSON.stringify(errorToOpenAi(429, e.message))}\n\n`);
           return res.end();
         }
+        releaseOnce();
         throw e;
       }
 
@@ -154,10 +167,12 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       } catch (e) {
         logger.error(`Stream interrupted: ${e.message}`);
       }
+      releaseOnce();
       stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
       res.write('data: [DONE]\n\n');
       return res.end();
     } catch (e) {
+      if (releaseStreamSlot) releaseStreamSlot();
       logger.error(`Stream setup failed: ${e.message}`);
       if (!res.headersSent) {
         const status = e.status || 500;

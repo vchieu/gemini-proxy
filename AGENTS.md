@@ -43,9 +43,9 @@ Bản dịch format nằm ở `api/translate.js` (`openAiToGemini`, `geminiToOpe
 |---|---|---|
 | Bootstrap | `index.js` | `main()` — load config → `StateStore` → `createServer` → `listen` |
 | Config Loader | `config/loader.js` | `loadConfig(configDir) → { keys, models, settings }` |
-| State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()`, `minCooldownRemaining(now)`, `snapshot()` |
-| Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` |
-| Selector | `router/selector.js` | `selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePairs) → SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
+| State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()` (lược bỏ inflight — transient), `reserve(k,m,est)`, `release(k,m,est)`, `minCooldownRemaining(now)`, `snapshot()` |
+| Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` (cộng `inflight_count`/`inflight_tokens` vào RPD/RPM/TPM — edge case #3) |
+| Selector | `router/selector.js` | `selectPair(...)` (thuần, không side-effect) + `selectAndReserve(...)` (select + `reserve` nguyên tử, caller BẮT BUỘC `release` mọi nhánh kết thúc) → `SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
 | Fallback | `router/fallbackLoop.js` | `handleRequest(agentRequest, { models, keys, stateStore, geminiClient, config }) → Promise<{ openAiResponse, usedKeyId, usedModel, attempts }>`; `class Aggregated429Error` |
 | Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)`; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
@@ -67,7 +67,7 @@ Quy tắc:
 1. Đọc AGENTS.md + file liên quan (xem §1).
 2. Chạy test baseline trước khi sửa: `node --test tests/*.test.js` (hoặc `npm test`, tương đương).
 3. Sửa code theo đúng contract §3 và thuật toán `gemini-proxy-plan.md` §6.
-4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`22/22` tại thời điểm viết file này).
+4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`26/26` tại thời điểm fix edge case #3; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM).
 5. Smoke-test server nếu đụng tới `api/`, `index.js`, `config/`: `node index.js` rồi kiểm tra
    `GET /health`, `GET /v1/models`, `GET /admin/status`, `POST /v1/chat/completions` (case thiếu `messages` phải 400).
 6. Cập nhật tài liệu theo §5 **trong cùng một change** — PR/change thiếu doc update được coi là chưa xong.
@@ -104,7 +104,7 @@ phải nêu rõ lý do trong báo cáo thay vì im lặng bỏ qua.
 
 1. Tất cả cặp cooldown → 429 tổng hợp + header `Retry-After` = cooldown ngắn nhất.
 2. Request ước lượng vượt TPM mọi model → lỗi rõ ràng, không loop vô hạn.
-3. Single-process: mutation state qua `StateStore` (đồng bộ); không cache `PairState` ra biến ngoài rồi ghi đè.
+3. Single-process: mutation state qua `StateStore` (đồng bộ); không cache `PairState` ra biến ngoài rồi ghi đè. Chống race đồng thời bằng **inflight reservation**: `selectAndReserve()` giữ chỗ ngay khi chọn (đồng bộ, không `await` ở giữa), `isAvailable()` cộng inflight vào RPD/RPM/TPM, caller (`fallbackLoop`, streaming trong `server.js`) BẮT BUỘC `release()` mọi nhánh kết thúc; inflight không persist và reset về 0 khi load. Không được gọi `selectPair()` thuần rồi `await` trước khi `recordSuccess` trong flow mới.
 4. Reset ngày theo PT (`utils/time.js`), không dùng giờ local.
 5. Lỗi non-429 (network/5xx) → trả lỗi ngay, không tính quota, không set cooldown.
 6. `respect_agent_model=true` mới tôn trọng model agent gửi; mặc định `false` (proxy tự chọn, `model: "auto"`).

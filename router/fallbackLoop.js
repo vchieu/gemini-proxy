@@ -1,4 +1,4 @@
-const { selectPair } = require('./selector');
+const { selectAndReserve } = require('./selector');
 const { extractRetryDelaySeconds, DEFAULT_COOLDOWN_SECONDS } = require('../client/errorParser');
 const { Gemini429Error } = require('../client/geminiClient');
 const { estimateTokens } = require('../utils/tokenEstimate');
@@ -63,7 +63,9 @@ async function handleRequest(agentRequest, { models, keys, stateStore, geminiCli
 
   while (attempts < maxAttempts) {
     const now = Date.now();
-    const pair = selectPair(candidateModels, keys, stateStore, now, estimated, triedPairs);
+    // select + reserve là 1 khối đồng bộ (không await ở giữa) nên các request
+    // đồng thời không thể cùng giữ 1 slot (edge case #3).
+    const pair = selectAndReserve(candidateModels, keys, stateStore, now, estimated, triedPairs);
     if (!pair) {
       const waitMs = minCooldownRemainingMs(candidateModels, keys, stateStore, now);
       const retryAfter = Math.max(1, Math.ceil(waitMs / 1000));
@@ -79,6 +81,7 @@ async function handleRequest(agentRequest, { models, keys, stateStore, geminiCli
       const geminiRes = await geminiClient.callGemini(pair.key, pair.model, geminiBody, { timeoutMs });
       const usage = geminiRes.usageMetadata || {};
       const totalTokens = usage.totalTokenCount || estimated;
+      stateStore.release(pair.key.id, pair.model.name, estimated);
       stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
       const openAiResponse = geminiToOpenAi(geminiRes, pair.model.name);
       logger.info(`Success with key=${pair.key.id} model=${pair.model.name}`, { tokens: totalTokens });
@@ -92,13 +95,15 @@ async function handleRequest(agentRequest, { models, keys, stateStore, geminiCli
         }
         // cộng buffer nhỏ 0.5s để tránh gọi lại đúng biên
         const unblockAt = Date.now() + Math.ceil(retrySeconds * 1000) + 500;
+        stateStore.release(pair.key.id, pair.model.name, estimated);
         stateStore.setCooldown(pair.key.id, pair.model.name, unblockAt);
         logger.warn(`429 from key=${pair.key.id} model=${pair.model.name}, cooldown ${retrySeconds}s`, { msg: e.message });
         triedPairs.push(pair);
         attempts += 1;
         continue;
       }
-      // lỗi khác 429 (network, 500...): trả lỗi ngay, không tính quota
+      // lỗi khác 429 (network, 500...): trả chỗ, trả lỗi ngay, không tính quota
+      stateStore.release(pair.key.id, pair.model.name, estimated);
       logger.error(`Non-429 error from key=${pair.key.id} model=${pair.model.name}: ${e.message}`);
       throw e;
     }
