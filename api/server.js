@@ -144,19 +144,21 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       let totalTokens = estimated;
       let streamCompleted = false;
 
-      // Khi client disconnect, abort upstream stream để tránh lãng phí tài nguyên.
-      // Không gọi getReader() ở đây — sẽ lock stream và mâu thuẫn với for-await bên dưới.
+      // Gemini streamGenerateContent?alt=sse trả về các dòng "data: {...}"
+      // Dùng reader duy nhất cho cả đọc lẫn cancel — tránh conflict giữa nhiều getReader().
+      const reader = upstream.body.getReader();
       res.on('close', () => {
-        if (!res.writableEnded && upstream.body && typeof upstream.body.cancel === 'function') {
-          upstream.body.cancel().catch(() => {});
+        if (!res.writableEnded) {
+          reader.cancel().catch(() => {});
         }
       });
 
-      // Gemini streamGenerateContent?alt=sse trả về các dòng "data: {...}"
       let buffer = '';
       try {
-        for await (const chunk of upstream.body) {
-          buffer += Buffer.from(chunk).toString('utf8');
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += Buffer.from(value).toString('utf8');
           const lines = buffer.split('\n');
           buffer = lines.pop();
           for (const line of lines) {

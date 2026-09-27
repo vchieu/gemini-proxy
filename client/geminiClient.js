@@ -98,7 +98,7 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
   const controller = new AbortController();
   let timedOut = false;
-  const timer = setTimeout(() => {
+  let timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
   }, timeoutMs);
@@ -125,7 +125,7 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     }, timeoutMs);
   };
   // Patch reader.read() để reset idle timeout mỗi khi có chunk.
-  // Tạo ReadableStream mới wrap reader đã patch — for await...of hoạt động bình thường.
+  // Tạo ReadableStream mới wrap reader đã patch — cleanup timer ngay trong pull/cancel.
   if (res.ok && res.body && typeof res.body.getReader === 'function') {
     const reader = res.body.getReader();
     const originalRead = reader.read.bind(reader);
@@ -136,11 +136,16 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     res.body = new ReadableStream({
       pull(controller) {
         return reader.read().then(({ done, value }) => {
-          if (done) controller.close();
-          else controller.enqueue(value);
+          if (done) {
+            controller.close();
+            clearTimeout(timer);
+          } else {
+            controller.enqueue(value);
+          }
         });
       },
       cancel(reason) {
+        clearTimeout(timer);
         return reader.cancel(reason);
       },
     });
@@ -163,11 +168,6 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     clearTimeout(timer);
     const text = await res.text();
     throw new GeminiError(`Gemini error ${res.status}: ${text}`, { status: res.status });
-  }
-  // Dọn dẹp timer khi stream kết thúc
-  if (res.body && typeof res.body.getReader === 'function') {
-    const cleanup = () => clearTimeout(timer);
-    res.body.getReader().closed.then(cleanup, cleanup);
   }
   return res;
 }
