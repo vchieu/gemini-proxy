@@ -111,16 +111,6 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       const geminiBody = openAiToGemini(agentRequest);
       logger.info(`Stream start: key=${pair.key.id} model=${pair.model.name}`);
 
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-      });
-
-      const streamId = `chatcmpl-${Date.now().toString(36)}`;
-      const created = Math.floor(Date.now() / 1000);
-      let totalTokens = estimated;
-
       let upstream;
       try {
         upstream = await client.callGeminiStream(pair.key, pair.model, geminiBody, {
@@ -141,6 +131,47 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         releaseOnce();
         throw e;
       }
+
+      // Tới đây là stream đã mở thành công — bắt đầu gửi response
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      });
+
+      const streamId = `chatcmpl-${Date.now().toString(36)}`;
+      const created = Math.floor(Date.now() / 1000);
+      let totalTokens = estimated;
+      let streamCompleted = false;
+
+      // Khi client disconnect, abort upstream stream để tránh lãng phí tài nguyên
+      let upstreamAbort = null;
+      if (upstream.body && typeof upstream.body.getReader === 'function') {
+        // fetch ReadableStream — dùng reader.cancel()
+        const reader = upstream.body.getReader();
+        upstreamAbort = () => reader.cancel().catch(() => {});
+        // Wrap thành async iterable từ reader
+        (async function* () {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              yield value;
+            }
+          } finally {
+            reader.releaseLock();
+          }
+        })().then(() => { upstream = { body: null }; });
+      } else if (upstream.body && typeof upstream.body.destroy === 'function') {
+        // Node Readable stream
+        upstreamAbort = () => upstream.body.destroy();
+      }
+
+      res.on('close', () => {
+        if (!res.writableEnded && upstreamAbort) {
+          upstreamAbort();
+        }
+      });
 
       // Gemini streamGenerateContent?alt=sse trả về các dòng "data: {...}"
       let buffer = '';
@@ -164,12 +195,16 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
             }
           }
         }
+        streamCompleted = true;
       } catch (e) {
         logger.error(`Stream interrupted: ${e.message}`);
       }
       releaseOnce();
-      stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
-      res.write('data: [DONE]\n\n');
+      // Chỉ recordSuccess + ghi [DONE] nếu stream hoàn tất không lỗi
+      if (streamCompleted) {
+        stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
+        res.write('data: [DONE]\n\n');
+      }
       return res.end();
     } catch (e) {
       if (releaseStreamSlot) releaseStreamSlot();

@@ -1,6 +1,6 @@
-const { nextMidnightPacific } = require('../utils/time');
-
 /**
+ * KIỂM TRA THUẦN — không mutate pairState (contract mới, xem AGENTS.md §3).
+ * Reset daily_count phải được gọi riêng qua StateStore.resetDailyIfNeeded().
  * @param {PairState} pairState
  * @param {ModelLimits} limits
  * @param {number} nowMs
@@ -14,11 +14,8 @@ function isAvailable(pairState, limits, nowMs, estimatedTokens) {
 
   if ((pairState.cooldown_until || 0) > now) return false;
 
-  // RPD: reset theo ngày PT. Cộng inflight để burst đồng thời không vượt RPD.
-  if (now >= (pairState.daily_reset_at || 0)) {
-    pairState.daily_count = 0;
-    pairState.daily_reset_at = nextMidnightPacific(now);
-  }
+  // RPD: Cộng inflight để burst đồng thời không vượt RPD.
+  // (daily_count đã được reset bởi resetDailyIfNeeded trước khi gọi isAvailable)
   if ((pairState.daily_count || 0) + (pairState.inflight_count || 0) >= limits.rpd) return false;
 
   // RPM: sliding window 60s (không mutate mảng gốc quá mức cần thiết).

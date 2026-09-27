@@ -91,11 +91,17 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
 
 /**
  * Gọi Gemini streaming (SSE). Trả về Response để caller pipe về client.
+ * Timeout cover CẢ stream body (idle timeout): nếu không nhận được data
+ * trong timeoutMs thì abort — tránh treo vô hạn nếu upstream im lặng.
  */
 async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   let res;
   try {
     res = await fetch(buildUrl(model, key.api_key, true), {
@@ -106,12 +112,56 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     });
   } catch (e) {
     clearTimeout(timer);
-    if (e.name === 'AbortError') throw new GeminiError(`Gemini request timeout after ${timeoutMs}ms`, { status: 504 });
+    if (timedOut || e.name === 'AbortError') throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
   }
-  clearTimeout(timer);
+  // Giữ timer cho tới khi stream body đọc xong — reset mỗi khi có data
+  const resetIdleTimeout = () => {
+    if (timedOut) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  };
+  // Patch body stream để reset idle timeout mỗi khi có chunk
+  if (res.ok && res.body) {
+    const originalBody = res.body;
+    if (typeof originalBody.pipe === 'function') {
+      // Node Readable — wrap qua PassThrough để reset timer
+      const { PassThrough } = require('stream');
+      const pt = new PassThrough();
+      originalBody.on('data', () => resetIdleTimeout());
+      originalBody.pipe(pt);
+      res.body = pt;
+    } else if (typeof originalBody.getReader === 'function') {
+      // fetch ReadableStream (browser-style) — wrap iterator
+      const reader = originalBody.getReader();
+      const self = res;
+      const wrapped = {
+        getReader() {
+          return {
+            read() {
+              return reader.read().then((result) => {
+                if (!result.done) resetIdleTimeout();
+                return result;
+              });
+            },
+            cancel(reason) {
+              return reader.cancel(reason);
+            },
+            releaseLock() {
+              reader.releaseLock();
+            },
+          };
+        },
+      };
+      res.body = wrapped;
+    }
+  }
 
   if (res.status === 429) {
+    clearTimeout(timer);
     const text = await res.text();
     let body;
     try { body = JSON.parse(text); } catch (_) { body = { error: { message: text } }; }
@@ -124,8 +174,18 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     });
   }
   if (!res.ok) {
+    clearTimeout(timer);
     const text = await res.text();
     throw new GeminiError(`Gemini error ${res.status}: ${text}`, { status: res.status });
+  }
+  // Khi stream kết thúc, dọn dẹp timer
+  if (res.body && typeof res.body.on === 'function') {
+    res.body.on('end', () => clearTimeout(timer));
+    res.body.on('close', () => clearTimeout(timer));
+  } else if (res.body && typeof res.body.getReader === 'function') {
+    // Đã wrap — reader gốc sẽ tự kết thúc; clearTimeout qua patch ở trên
+    const cleanup = () => clearTimeout(timer);
+    res.body.getReader().closed.then(cleanup, cleanup);
   }
   return res;
 }

@@ -1,6 +1,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { isAvailable } = require('../state/cooldown');
+const { StateStore } = require('../state/store');
 const { nextMidnightPacific } = require('../utils/time');
 
 function blank(over = {}) {
@@ -39,10 +40,15 @@ describe('isAvailable', () => {
   });
   it('RPD resets after daily_reset_at (PT)', () => {
     const now = Date.now();
-    const st = blank({ daily_count: 20, daily_reset_at: now - 1000 });
-    assert.equal(isAvailable(st, limits, now, 10), true);
+    const store = new StateStore(null);
+    store.resetDailyIfNeeded('key-1', 'm', now - 1000); // set daily_reset_at trong quá khứ
+    const st = store.get('key-1', 'm');
+    st.daily_count = 20;
+    st.daily_reset_at = now - 1000; // quá khứ → cần reset
+    store.resetDailyIfNeeded('key-1', 'm', now);
     assert.equal(st.daily_count, 0);
     assert.ok(st.daily_reset_at > now);
+    assert.equal(isAvailable(st, limits, now, 10), true);
   });
   it('TPM threshold blocks', () => {
     const now = Date.now();

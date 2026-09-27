@@ -14,9 +14,10 @@ function _resetRoundRobin() {
  * @param {number} nowMs
  * @param {number} estimatedTokens
  * @param {SelectedPair[]} excludePairs  // các cặp đã thử và fail trong request hiện tại
+ * @param {string} [strategy]  // 'round_robin_key_then_model' | 'priority_model_first'
  * @returns {SelectedPair | null}
  */
-function selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePairs) {
+function selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePairs, strategy) {
   const now = Number(nowMs !== undefined ? nowMs : Date.now());
   const est = Number(estimatedTokens) || 0;
   const excluded = new Set((excludePairs || []).map((p) => `${p.key.id}::${p.model.name}`));
@@ -25,6 +26,29 @@ function selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePai
   const enabledKeys = (keys || []).filter((k) => k.enabled !== false);
   if (sortedModels.length === 0 || enabledKeys.length === 0) return null;
 
+  // Reset daily_count cho tất cả cặp trước khi check (isAvailable giờ thuần, không tự reset)
+  for (const model of sortedModels) {
+    for (const key of enabledKeys) {
+      stateStore.resetDailyIfNeeded(key.id, model.name, now);
+    }
+  }
+
+  if (strategy === 'priority_model_first') {
+    // Thử hết keys của model ưu tiên cao nhất trước, rồi mới sang model kế tiếp
+    for (const model of sortedModels) {
+      for (const key of enabledKeys) {
+        const pairKey = `${key.id}::${model.name}`;
+        if (excluded.has(pairKey)) continue;
+        const st = stateStore.get(key.id, model.name);
+        if (isAvailable(st, model.limits, now, est)) {
+          return { key, model };
+        }
+      }
+    }
+    return null;
+  }
+
+  // Mặc định: round_robin_key_then_model — xoay key cho mỗi model
   for (const model of sortedModels) {
     const n = enabledKeys.length;
     const start = cursors.get(model.name) || 0;
@@ -48,10 +72,11 @@ function selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePai
  * request đồng thời không cùng chọn 1 cặp (edge case #3 — plan §10.3).
  * Caller BẮT BUỘC gọi `stateStore.release(key.id, model.name, estimatedTokens)`
  * trong mọi nhánh kết thúc (thành công / 429 / lỗi khác).
+ * @param {string} [strategy]  // 'round_robin_key_then_model' | 'priority_model_first'
  * @returns {SelectedPair | null} null nếu không còn cặp khả dụng
  */
-function selectAndReserve(models, keys, stateStore, nowMs, estimatedTokens, excludePairs) {
-  const pair = selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePairs);
+function selectAndReserve(models, keys, stateStore, nowMs, estimatedTokens, excludePairs, strategy) {
+  const pair = selectPair(models, keys, stateStore, nowMs, estimatedTokens, excludePairs, strategy);
   if (pair) stateStore.reserve(pair.key.id, pair.model.name, estimatedTokens);
   return pair;
 }

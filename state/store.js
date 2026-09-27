@@ -25,6 +25,8 @@ class StateStore {
     this.statePath = statePath;
     /** @type {Map<string, PairState>} */
     this.map = new Map();
+    this._persistDelay = 500; // ms — debounce để tránh sync write mỗi request
+    this._persistTimer = null;
     if (statePath && fs.existsSync(statePath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
@@ -71,6 +73,16 @@ class StateStore {
     return false;
   }
 
+  /**
+   * Reset daily_count của 1 cặp nếu đã qua nửa đêm PT. Gọi TRƯỚC isAvailable()
+   * để đảm bảo daily_count là fresh (isAvailable giờ là hàm thuần, không tự reset).
+   * @returns {boolean} true nếu đã reset
+   */
+  resetDailyIfNeeded(keyId, modelName, nowMs) {
+    const st = this.get(keyId, modelName);
+    return this.maybeResetDaily(st, nowMs);
+  }
+
   /** Ghi nhận 1 request thành công: thêm timestamp, +1 daily_count, thêm token usage */
   recordSuccess(keyId, modelName, tokensUsed) {
     const now = Date.now();
@@ -81,7 +93,7 @@ class StateStore {
     st.daily_count += 1;
     const t = Number(tokensUsed) || 0;
     if (t > 0) st.token_timestamps.push([now, t]);
-    this.persist();
+    this.schedulePersist();
     return st;
   }
 
@@ -89,7 +101,7 @@ class StateStore {
   setCooldown(keyId, modelName, unblockAtMs) {
     const st = this.get(keyId, modelName);
     st.cooldown_until = Math.max(st.cooldown_until || 0, Number(unblockAtMs) || 0);
-    this.persist();
+    this.schedulePersist();
     return st;
   }
 
@@ -132,6 +144,19 @@ class StateStore {
     return pairState;
   }
 
+  /**
+   * Debounced persist — gọi thay persist() trong recordSuccess/setCooldown
+   * để tránh sync write mỗi request. Tests vẫn gọi persist() trực tiếp.
+   */
+  schedulePersist() {
+    if (!this.statePath) return;
+    if (this._persistTimer) return; // đã có timer chờ
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      this.persist();
+    }, this._persistDelay);
+  }
+
   /** Lưu toàn bộ state ra file (JSON.stringify). Inflight bị lược bỏ vì là transient. */
   persist() {
     if (!this.statePath) return;
@@ -145,19 +170,21 @@ class StateStore {
         void inflight_tokens;
         pairs[k] = durable;
       }
-      fs.writeFileSync(this.statePath, JSON.stringify({ pairs }, null, 2), 'utf8');
+      // Atomic write: ghi vào .tmp rồi rename để tránh corruption nếu crash giữa chừng
+      const tmpPath = `${this.statePath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify({ pairs }, null, 2), 'utf8');
+      fs.renameSync(tmpPath, this.statePath);
     } catch (e) {
       console.warn(`[StateStore] persist failed: ${e.message}`);
     }
   }
 
   /** Thời gian cooldown còn lại ngắn nhất (ms), 0 nếu không có cặp nào cooldown */
-  minCooldownRemaining(nowMs, filterKeys) {
+  minCooldownRemaining(nowMs) {
     let min = Infinity;
     for (const [, st] of this.map.entries()) {
       if (st.cooldown_until > nowMs) min = Math.min(min, st.cooldown_until - nowMs);
     }
-    void filterKeys;
     return min === Infinity ? 0 : min;
   }
 

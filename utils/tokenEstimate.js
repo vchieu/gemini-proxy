@@ -59,9 +59,7 @@ function estimateTokens(messages) {
     return total;
   }
   if (typeof messages === 'object') {
-    return countTextTokens(JSON.stringify(messages)) / 4 > 0
-      ? Math.ceil(JSON.stringify(messages).length / 4)
-      : 0;
+    return Math.ceil(JSON.stringify(messages).length / 4);
   }
   return 0;
 }
