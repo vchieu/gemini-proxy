@@ -94,7 +94,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         if (found.length > 0) candidateModels = found;
       }
       const estimated = estimateTokens(agentRequest.messages);
-      const pair = selectAndReserve(candidateModels, keys, stateStore, Date.now(), estimated, []);
+      const pair = selectAndReserve(candidateModels, keys, stateStore, Date.now(), estimated, [], config && config.strategy);
       if (!pair) {
         res.set('Retry-After', String(config.default_cooldown_seconds || 30));
         return res.status(429).json(errorToOpenAi(429, 'Tất cả model/key đều đang bị giới hạn'));
@@ -144,32 +144,11 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       let totalTokens = estimated;
       let streamCompleted = false;
 
-      // Khi client disconnect, abort upstream stream để tránh lãng phí tài nguyên
-      let upstreamAbort = null;
-      if (upstream.body && typeof upstream.body.getReader === 'function') {
-        // fetch ReadableStream — dùng reader.cancel()
-        const reader = upstream.body.getReader();
-        upstreamAbort = () => reader.cancel().catch(() => {});
-        // Wrap thành async iterable từ reader
-        (async function* () {
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              yield value;
-            }
-          } finally {
-            reader.releaseLock();
-          }
-        })().then(() => { upstream = { body: null }; });
-      } else if (upstream.body && typeof upstream.body.destroy === 'function') {
-        // Node Readable stream
-        upstreamAbort = () => upstream.body.destroy();
-      }
-
+      // Khi client disconnect, abort upstream stream để tránh lãng phí tài nguyên.
+      // Không gọi getReader() ở đây — sẽ lock stream và mâu thuẫn với for-await bên dưới.
       res.on('close', () => {
-        if (!res.writableEnded && upstreamAbort) {
-          upstreamAbort();
+        if (!res.writableEnded && upstream.body && typeof upstream.body.cancel === 'function') {
+          upstream.body.cancel().catch(() => {});
         }
       });
 

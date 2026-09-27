@@ -65,7 +65,7 @@ async function handleRequest(agentRequest, { models, keys, stateStore, geminiCli
     const now = Date.now();
     // select + reserve là 1 khối đồng bộ (không await ở giữa) nên các request
     // đồng thời không thể cùng giữ 1 slot (edge case #3).
-    const pair = selectAndReserve(candidateModels, keys, stateStore, now, estimated, triedPairs);
+    const pair = selectAndReserve(candidateModels, keys, stateStore, now, estimated, triedPairs, config && config.strategy);
     if (!pair) {
       const waitMs = minCooldownRemainingMs(candidateModels, keys, stateStore, now);
       const retryAfter = Math.max(1, Math.ceil(waitMs / 1000));

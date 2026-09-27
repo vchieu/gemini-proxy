@@ -124,40 +124,26 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
       controller.abort();
     }, timeoutMs);
   };
-  // Patch body stream để reset idle timeout mỗi khi có chunk
-  if (res.ok && res.body) {
-    const originalBody = res.body;
-    if (typeof originalBody.pipe === 'function') {
-      // Node Readable — wrap qua PassThrough để reset timer
-      const { PassThrough } = require('stream');
-      const pt = new PassThrough();
-      originalBody.on('data', () => resetIdleTimeout());
-      originalBody.pipe(pt);
-      res.body = pt;
-    } else if (typeof originalBody.getReader === 'function') {
-      // fetch ReadableStream (browser-style) — wrap iterator
-      const reader = originalBody.getReader();
-      const self = res;
-      const wrapped = {
-        getReader() {
-          return {
-            read() {
-              return reader.read().then((result) => {
-                if (!result.done) resetIdleTimeout();
-                return result;
-              });
-            },
-            cancel(reason) {
-              return reader.cancel(reason);
-            },
-            releaseLock() {
-              reader.releaseLock();
-            },
-          };
-        },
-      };
-      res.body = wrapped;
-    }
+  // Patch reader.read() để reset idle timeout mỗi khi có chunk.
+  // Tạo ReadableStream mới wrap reader đã patch — for await...of hoạt động bình thường.
+  if (res.ok && res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const originalRead = reader.read.bind(reader);
+    reader.read = () => originalRead().then((result) => {
+      if (!result.done) resetIdleTimeout();
+      return result;
+    });
+    res.body = new ReadableStream({
+      pull(controller) {
+        return reader.read().then(({ done, value }) => {
+          if (done) controller.close();
+          else controller.enqueue(value);
+        });
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+    });
   }
 
   if (res.status === 429) {
@@ -178,12 +164,8 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     const text = await res.text();
     throw new GeminiError(`Gemini error ${res.status}: ${text}`, { status: res.status });
   }
-  // Khi stream kết thúc, dọn dẹp timer
-  if (res.body && typeof res.body.on === 'function') {
-    res.body.on('end', () => clearTimeout(timer));
-    res.body.on('close', () => clearTimeout(timer));
-  } else if (res.body && typeof res.body.getReader === 'function') {
-    // Đã wrap — reader gốc sẽ tự kết thúc; clearTimeout qua patch ở trên
+  // Dọn dẹp timer khi stream kết thúc
+  if (res.body && typeof res.body.getReader === 'function') {
     const cleanup = () => clearTimeout(timer);
     res.body.getReader().closed.then(cleanup, cleanup);
   }
