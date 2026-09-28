@@ -135,14 +135,20 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     });
     res.body = new ReadableStream({
       pull(controller) {
-        return reader.read().then(({ done, value }) => {
-          if (done) {
-            controller.close();
+        return reader.read().then(
+          ({ done, value }) => {
+            if (done) {
+              controller.close();
+              clearTimeout(timer);
+            } else {
+              controller.enqueue(value);
+            }
+          },
+          (err) => {
             clearTimeout(timer);
-          } else {
-            controller.enqueue(value);
+            throw err;
           }
-        });
+        );
       },
       cancel(reason) {
         clearTimeout(timer);
