@@ -50,7 +50,7 @@ Bản dịch format nằm ở `api/translate.js` (`openAiToGemini`, `geminiToOpe
 | Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)` trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc, vì `Response.body` không gán được); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
 | API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app` |
-| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, model, streamId, created)` |
+| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, model, streamId, created)`; hỗ trợ tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse` |
 | Token estimate | `utils/tokenEstimate.js` | `estimateTokens(messages) → number` (heuristic chars/4 + 4 token overhead/message) |
 | Time | `utils/time.js` | `nextMidnightPacific(nowMs) → ms` |
 | Logger | `utils/logger.js` | `logger.{debug,info,warn,error}`, `createLogger(level)` |
@@ -67,7 +67,7 @@ Quy tắc:
 1. Đọc AGENTS.md + file liên quan (xem §1).
 2. Chạy test baseline trước khi sửa: `node --test tests/*.test.js` (hoặc `npm test`, tương đương).
 3. Sửa code theo đúng contract §3 và thuật toán `gemini-proxy-plan.md` §6.
-4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`35/35` tại thời điểm fix streaming fallback + shutdown flush; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM, `tests/streaming.test.js` khóa fallback 429 + client disconnect, `tests/geminiStream.test.js` khóa real Response body).
+4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`40/40` tại thời điểm implement tool/function-calling; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM, `tests/streaming.test.js` khóa fallback 429 + client disconnect, `tests/geminiStream.test.js` khóa real Response body, `tests/translate.test.js` khóa tool/function-calling).
 5. Smoke-test server nếu đụng tới `api/`, `index.js`, `config/`: `node index.js` rồi kiểm tra
    `GET /health`, `GET /v1/models`, `GET /admin/status`, `POST /v1/chat/completions` (case thiếu `messages` phải 400).
 6. Cập nhật tài liệu theo §5 **trong cùng một change** — PR/change thiếu doc update được coi là chưa xong.

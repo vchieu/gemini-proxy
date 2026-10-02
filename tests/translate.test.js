@@ -24,6 +24,80 @@ describe('translate', () => {
     assert.equal(oai.usage.total_tokens, 13);
     assert.equal(oai.model, 'gemini-2.5-flash');
   });
+
+  it('translates tools to functionDeclarations', () => {
+    const g = openAiToGemini({
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get weather',
+          parameters: { type: 'object', properties: { city: { type: 'string' } } },
+        },
+      }],
+    });
+    assert.ok(g.tools);
+    assert.equal(g.tools[0].functionDeclarations[0].name, 'get_weather');
+    assert.equal(g.tools[0].functionDeclarations[0].description, 'Get weather');
+  });
+
+  it('translates tool_choice to toolConfig', () => {
+    const g = openAiToGemini({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'f', description: '', parameters: {} } }],
+      tool_choice: 'none',
+    });
+    assert.equal(g.toolConfig.functionCallingConfig.mode, 'NONE');
+  });
+
+  it('translates assistant tool_calls to functionCall', () => {
+    const g = openAiToGemini({
+      messages: [
+        { role: 'user', content: 'weather?' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'get_weather', arguments: '{"city":"HN"}' },
+          }],
+        },
+      ],
+    });
+    assert.equal(g.contents[1].role, 'model');
+    const fc = g.contents[1].parts.find((p) => p.functionCall);
+    assert.ok(fc, 'should have functionCall part');
+    assert.equal(fc.functionCall.name, 'get_weather');
+    assert.deepEqual(fc.functionCall.args, { city: 'HN' });
+  });
+
+  it('translates tool result to functionResponse', () => {
+    const g = openAiToGemini({
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'call_1', content: '{"temp":25}' },
+      ],
+    });
+    assert.equal(g.contents[2].role, 'user');
+    assert.equal(g.contents[2].parts[0].functionResponse.name, 'get_weather');
+    assert.deepEqual(g.contents[2].parts[0].functionResponse.response, { temp: 25 });
+  });
+
+  it('maps gemini functionCall to OpenAI tool_calls', () => {
+    const oai = geminiToOpenAi({
+      candidates: [{
+        content: { parts: [{ functionCall: { name: 'get_weather', args: { city: 'HN' } } }] },
+        finishReason: 'STOP',
+      }],
+    }, 'gemini-2.5-flash');
+    assert.ok(oai.choices[0].message.tool_calls);
+    assert.equal(oai.choices[0].message.tool_calls[0].function.name, 'get_weather');
+    assert.equal(oai.choices[0].message.tool_calls[0].function.arguments, '{"city":"HN"}');
+    assert.equal(oai.choices[0].finish_reason, 'tool_calls');
+  });
 });
 
 describe('tokenEstimate', () => {
