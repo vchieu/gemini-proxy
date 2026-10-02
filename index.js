@@ -17,10 +17,18 @@ function main() {
   const app = createServer({ models, keys, stateStore, config: settings });
 
   const enabledKeys = keys.filter((k) => k.enabled !== false).length;
-  app.listen(settings.port, () => {
+  const server = app.listen(settings.port, () => {
     logger.info(`gemini-proxy listening on http://localhost:${settings.port}`);
     logger.info(`Loaded ${enabledKeys}/${keys.length} keys, ${models.length} models, strategy=${settings.strategy}`);
   });
+  const shutdown = (sig) => {
+    logger.info(`${sig} received, flushing state`);
+    stateStore.flush();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2000).unref();
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 if (require.main === module) {

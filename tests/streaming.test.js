@@ -2,7 +2,10 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { StateStore } = require('../state/store');
 const { createServer } = require('../api/server');
+const { Gemini429Error } = require('../client/geminiClient');
 const http = require('http');
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function makeReadableStream(chunks) {
   return new ReadableStream({
@@ -105,6 +108,71 @@ describe('streaming route (ReadableStream body)', () => {
     } finally {
       server.close();
     }
+  });
+
+  it('falls back to next pair on upstream 429 before opening stream', async () => {
+    const store = new StateStore(null);
+    const models = [
+      { name: 'a', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1e6 } },
+      { name: 'b', priority: 2, limits: { rpm: 100, rpd: 1000, tpm: 1e6 } },
+    ];
+    const keys = [{ id: 'key-1', api_key: 'k1', enabled: true }];
+    const sse = 'data: ' + JSON.stringify({ candidates: [{ content: { parts: [{ text: 'hello' }] }, finishReason: 'STOP' }] }) + '\n\n';
+    const fakeClient = {
+      callGeminiStream: async (key, model) => {
+        if (model.name === 'a') throw new Gemini429Error('retry in 5s', { retryDelaySeconds: 5 });
+        return { body: makeSSEBody(sse) };
+      },
+    };
+    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const server = app.listen(0);
+    await new Promise((r) => server.once('listening', r));
+    try {
+      const res = await post(server.address().port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      assert.ok(res.body.includes('hello') && res.body.includes('[DONE]'));
+      assert.ok(store.get('key-1', 'a').cooldown_until > Date.now());
+      assert.equal(store.get('key-1', 'b').daily_count, 1);
+    } finally { server.close(); }
+  });
+
+  it('does NOT recordSuccess/[DONE] when client disconnects mid-stream, and releases slot', async () => {
+    const store = new StateStore(null);
+    const models = [{ name: 'm', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1e6 } }];
+    const keys = [{ id: 'key-1', api_key: 'k1', enabled: true }];
+    const enc = new TextEncoder();
+    let cancelled = false;
+    const infinite = new ReadableStream({
+      pull(c) {
+        return new Promise((r) => setTimeout(() => {
+          try {
+            c.enqueue(enc.encode('data: ' + JSON.stringify({ candidates: [{ content: { parts: [{ text: 'x' }] } }] }) + '\n\n'));
+          } catch (_) { /* controller đã đóng sau cancel */ }
+          r();
+        }, 20));
+      },
+      cancel() { cancelled = true; },
+    });
+    const fakeClient = { callGeminiStream: async () => ({ body: infinite }) };
+    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const server = app.listen(0);
+    await new Promise((r) => server.once('listening', r));
+    const port = server.address().port;
+    try {
+      const data = JSON.stringify({ model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      await new Promise((resolve) => {
+        const req = http.request({ hostname: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } },
+          (res) => { res.on('error', () => {}); res.once('data', () => { req.destroy(); resolve(); }); });
+        req.on('error', () => {});
+        req.write(data); req.end();
+      });
+      await delay(150);
+      const st = store.get('key-1', 'm');
+      assert.equal(st.daily_count, 0);
+      assert.equal(st.inflight_count, 0);
+      assert.equal(cancelled, true);
+    } finally { server.close(); }
   });
 
   it('returns 429 when all pairs exhausted', async () => {

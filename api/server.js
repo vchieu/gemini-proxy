@@ -1,26 +1,25 @@
 const express = require('express');
-const { handleRequest, Aggregated429Error } = require('../router/fallbackLoop');
-const { selectAndReserve } = require('../router/selector');
-const { openAiToGemini, geminiChunkToOpenAiChunk } = require('./translate');
-const { estimateTokens } = require('../utils/tokenEstimate');
-const { extractRetryDelaySeconds } = require('../client/errorParser');
-const { Gemini429Error } = require('../client/geminiClient');
+const { handleRequest, openStream, Aggregated429Error } = require('../router/fallbackLoop');
+const { geminiChunkToOpenAiChunk } = require('./translate');
 const { logger } = require('../utils/logger');
 
 function errorToOpenAi(status, message, code) {
   return { error: { message, type: code || (status === 429 ? 'rate_limit_exceeded' : 'api_error'), code: String(status) } };
 }
 
-/**
- * Khởi tạo Express app với 3 route chính:
- *  POST /v1/chat/completions
- *  GET  /v1/models
- *  GET  /admin/status
- * @param {{models, keys, stateStore, config, geminiClient?}} deps
- * @returns {import('express').Express}
- */
+function sendError(res, e, config) {
+  if (e instanceof Aggregated429Error || e.status === 429) {
+    const retryAfter = e.retryAfterSeconds || (config && config.default_cooldown_seconds) || 30;
+    res.set('Retry-After', String(Math.ceil(retryAfter)));
+    return res.status(429).json(errorToOpenAi(429, e.message));
+  }
+  const status = Number.isInteger(e.status) ? e.status : 500;
+  return res.status(status).json(errorToOpenAi(status, e.message || 'Internal error'));
+}
+
 function createServer({ models, keys, stateStore, config, geminiClient }) {
   const client = geminiClient || require('../client/geminiClient');
+  const deps = { models, keys, stateStore, geminiClient: client, config };
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
@@ -38,6 +37,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     const pairs = [];
     for (const m of models) {
       for (const k of keys) {
+        stateStore.resetDailyIfNeeded(k.id, m.name, now); // #9
         const st = stateStore.get(k.id, m.name);
         stateStore.pruneOldEntries(st, now);
         const recentReq = st.request_timestamps.length;
@@ -67,135 +67,93 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     if (!Array.isArray(agentRequest.messages)) {
       return res.status(400).json(errorToOpenAi(400, 'Field "messages" (array) is required', 'invalid_request_error'));
     }
-    const stream = agentRequest.stream === true;
 
-    if (!stream) {
+    if (agentRequest.stream !== true) {
       try {
-        const result = await handleRequest(agentRequest, { models, keys, stateStore, geminiClient: client, config });
+        const result = await handleRequest(agentRequest, deps);
         return res.json(result.openAiResponse);
       } catch (e) {
-        if (e instanceof Aggregated429Error || e.status === 429) {
-          const retryAfter = e.retryAfterSeconds || config.default_cooldown_seconds || 30;
-          res.set('Retry-After', String(retryAfter));
-          return res.status(429).json(errorToOpenAi(429, e.message));
-        }
-        const status = e.status && Number.isInteger(e.status) ? e.status : 500;
-        return res.status(status).json(errorToOpenAi(status, e.message || 'Internal error'));
+        return sendError(res, e, config);
       }
     }
 
-    // ---- streaming: kiểm tra rate-limit TRƯỚC khi stream (edge case 7) ----
-    // releaseStreamSlot: trả chỗ đã giữ nếu có lỗi xảy ra ngoài các nhánh trong.
-    let releaseStreamSlot = null;
+    // ---- streaming: fallback + kiểm tra limit TRƯỚC khi gửi byte đầu (edge case 7) ----
+    let handle;
     try {
-      let candidateModels = models;
-      if (config.respect_agent_model && agentRequest.model && agentRequest.model !== 'auto') {
-        const found = models.filter((m) => m.name === agentRequest.model);
-        if (found.length > 0) candidateModels = found;
-      }
-      const estimated = estimateTokens(agentRequest.messages);
-      const pair = selectAndReserve(candidateModels, keys, stateStore, Date.now(), estimated, [], config && config.strategy);
-      if (!pair) {
-        res.set('Retry-After', String(config.default_cooldown_seconds || 30));
-        return res.status(429).json(errorToOpenAi(429, 'Tất cả model/key đều đang bị giới hạn'));
-      }
-      // Mọi đường thoát phía dưới phải release chỗ đã giữ.
-      let released = false;
-      const releaseOnce = () => {
-        if (!released) {
-          released = true;
-          stateStore.release(pair.key.id, pair.model.name, estimated);
-        }
-      };
-      releaseStreamSlot = releaseOnce;
-      const geminiBody = openAiToGemini(agentRequest);
-      logger.info(`Stream start: key=${pair.key.id} model=${pair.model.name}`);
-
-      let upstream;
-      try {
-        upstream = await client.callGeminiStream(pair.key, pair.model, geminiBody, {
-          timeoutMs: config.request_timeout_ms,
-        });
-      } catch (e) {
-        if (e instanceof Gemini429Error || e.status === 429) {
-          const retrySeconds = e.retryDelaySeconds || extractRetryDelaySeconds({ error: { message: e.message } });
-          releaseOnce();
-          stateStore.setCooldown(pair.key.id, pair.model.name, Date.now() + retrySeconds * 1000 + 500);
-          if (!res.headersSent) {
-            res.set('Retry-After', String(Math.ceil(retrySeconds)));
-            return res.status(429).json(errorToOpenAi(429, e.message));
-          }
-          res.write(`data: ${JSON.stringify(errorToOpenAi(429, e.message))}\n\n`);
-          return res.end();
-        }
-        releaseOnce();
-        throw e;
-      }
-
-      // Tới đây là stream đã mở thành công — bắt đầu gửi response
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-      });
-
-      const streamId = `chatcmpl-${Date.now().toString(36)}`;
-      const created = Math.floor(Date.now() / 1000);
-      let totalTokens = estimated;
-      let streamCompleted = false;
-
-      // Gemini streamGenerateContent?alt=sse trả về các dòng "data: {...}"
-      // Dùng reader duy nhất cho cả đọc lẫn cancel — tránh conflict giữa nhiều getReader().
-      const reader = upstream.body.getReader();
-      res.on('close', () => {
-        if (!res.writableEnded) {
-          reader.cancel().catch(() => {});
-        }
-      });
-
-      let buffer = '';
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += Buffer.from(value).toString('utf8');
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-          for (const line of lines) {
-            const t = line.trim();
-            if (!t.startsWith('data:')) continue;
-            const payload = t.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-            try {
-              const g = JSON.parse(payload);
-              if (g.usageMetadata && g.usageMetadata.totalTokenCount) totalTokens = g.usageMetadata.totalTokenCount;
-              const oai = geminiChunkToOpenAiChunk(g, pair.model.name, streamId, created);
-              res.write(`data: ${JSON.stringify(oai)}\n\n`);
-            } catch (_) {
-              // bỏ qua chunk không parse được
-            }
-          }
-        }
-        streamCompleted = true;
-      } catch (e) {
-        logger.error(`Stream interrupted: ${e.message}`);
-      }
-      releaseOnce();
-      // Chỉ recordSuccess + ghi [DONE] nếu stream hoàn tất không lỗi
-      if (streamCompleted) {
-        stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
-        res.write('data: [DONE]\n\n');
-      }
-      return res.end();
+      handle = await openStream(agentRequest, deps);
     } catch (e) {
-      if (releaseStreamSlot) releaseStreamSlot();
-      logger.error(`Stream setup failed: ${e.message}`);
-      if (!res.headersSent) {
-        const status = e.status || 500;
-        return res.status(status).json(errorToOpenAi(status, e.message));
-      }
-      try { res.end(); } catch (_) {}
+      logger.warn(`Stream open failed: ${e.message}`);
+      return sendError(res, e, config);
     }
+    const { upstream, pair, release } = handle;
+    logger.info(`Stream start: key=${pair.key.id} model=${pair.model.name}`);
+
+    let reader;
+    try {
+      reader = upstream.body.getReader();
+    } catch (e) {
+      release();
+      return sendError(res, e, config);
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+
+    const streamId = `chatcmpl-${Date.now().toString(36)}`;
+    const created = Math.floor(Date.now() / 1000);
+    let totalTokens = handle.estimated;
+    let streamCompleted = false;
+    let clientAborted = false;
+    let streamError = null;
+
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientAborted = true; // #2: cancel do disconnect KHÔNG được coi là hoàn tất
+        reader.cancel().catch(() => {});
+      }
+    });
+
+    const handleLine = (line) => {
+      const t = line.trim();
+      if (!t.startsWith('data:')) return;
+      const payload = t.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+      try {
+        const g = JSON.parse(payload);
+        if (g.usageMetadata && g.usageMetadata.totalTokenCount) totalTokens = g.usageMetadata.totalTokenCount;
+        res.write(`data: ${JSON.stringify(geminiChunkToOpenAiChunk(g, pair.model.name, streamId, created))}\n\n`);
+      } catch (_) { /* bỏ qua chunk không parse được */ }
+    };
+
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (clientAborted) break;
+        buffer += Buffer.from(value).toString('utf8');
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) handleLine(line);
+      }
+      if (!clientAborted && buffer) handleLine(buffer); // dòng cuối không có '\n'
+      streamCompleted = !clientAborted;
+    } catch (e) {
+      streamError = e;
+      logger.error(`Stream interrupted: ${e.message}`);
+    }
+
+    release();
+    if (streamCompleted) {
+      stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
+      res.write('data: [DONE]\n\n');
+    } else if (streamError && !clientAborted) {
+      res.write(`data: ${JSON.stringify(errorToOpenAi(streamError.status || 502, streamError.message))}\n\n`);
+    }
+    return res.end();
   });
 
   return app;

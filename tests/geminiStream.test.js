@@ -68,6 +68,17 @@ describe('callGeminiStream (real, mock global.fetch)', () => {
     );
   });
 
+  it('works with a REAL Response (body getter-only) and leaves caller able to getReader', async () => {
+    const enc = new TextEncoder();
+    global.fetch = async () => new Response(new ReadableStream({
+      start(c) { c.enqueue(enc.encode('data: {"a":1}\n\n')); c.close(); },
+    }), { status: 200 });
+    const res = await callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 5000 });
+    const reader = res.body.getReader(); // trước fix: TypeError locked
+    const { value } = await reader.read();
+    assert.ok(Buffer.from(value).toString().includes('"a":1'));
+  });
+
   it('throws GeminiError on 500 response', async () => {
     global.fetch = async () => ({
       ok: false,

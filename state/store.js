@@ -179,6 +179,12 @@ class StateStore {
     }
   }
 
+  /** Huỷ debounce timer và ghi state ngay (dùng khi shutdown). */
+  flush() {
+    if (this._persistTimer) { clearTimeout(this._persistTimer); this._persistTimer = null; }
+    this.persist();
+  }
+
   /** Thời gian cooldown còn lại ngắn nhất (ms), 0 nếu không có cặp nào cooldown */
   minCooldownRemaining(nowMs) {
     let min = Infinity;

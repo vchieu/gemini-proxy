@@ -43,7 +43,7 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res;
+  let res, text;
   try {
     res = await fetch(buildUrl(model, key.api_key, false), {
       method: 'POST',
@@ -51,20 +51,16 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
       body: JSON.stringify(geminiRequestBody),
       signal: controller.signal,
     });
+    text = await res.text(); // timeout phủ cả lúc đọc body (#5)
   } catch (e) {
-    clearTimeout(timer);
     if (e.name === 'AbortError') throw new GeminiError(`Gemini request timeout after ${timeoutMs}ms`, { status: 504 });
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
+  } finally {
+    clearTimeout(timer);
   }
-  clearTimeout(timer);
 
   let body;
-  const text = await res.text();
-  try {
-    body = text ? JSON.parse(text) : {};
-  } catch (_) {
-    body = { raw: text };
-  }
+  try { body = text ? JSON.parse(text) : {}; } catch (_) { body = { raw: text }; }
 
   if (res.status === 429 || res.status === 403) {
     // Gemini đôi khi trả 403 kèm quota message — coi như 429 nếu có retry info
@@ -90,18 +86,17 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
 }
 
 /**
- * Gọi Gemini streaming (SSE). Trả về Response để caller pipe về client.
- * Timeout cover CẢ stream body (idle timeout): nếu không nhận được data
- * trong timeoutMs thì abort — tránh treo vô hạn nếu upstream im lặng.
+ * Gọi Gemini streaming (SSE). Trả về object mới bọc stream, reset idle timeout mỗi chunk.
+ * KHÔNG trả Response gốc vì Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng.
+ * @returns {Promise<{ ok: boolean, status: number, headers: object, body: ReadableStream }>}
  */
 async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
   const controller = new AbortController();
   let timedOut = false;
-  let timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+  const onTimeout = () => { timedOut = true; controller.abort(); };
+  let timer = setTimeout(onTimeout, timeoutMs);
+
   let res;
   try {
     res = await fetch(buildUrl(model, key.api_key, true), {
@@ -114,47 +109,6 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     clearTimeout(timer);
     if (timedOut || e.name === 'AbortError') throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
-  }
-  // Giữ timer cho tới khi stream body đọc xong — reset mỗi khi có data
-  const resetIdleTimeout = () => {
-    if (timedOut) return;
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
-  };
-  // Patch reader.read() để reset idle timeout mỗi khi có chunk.
-  // Tạo ReadableStream mới wrap reader đã patch — cleanup timer ngay trong pull/cancel.
-  if (res.ok && res.body && typeof res.body.getReader === 'function') {
-    const reader = res.body.getReader();
-    const originalRead = reader.read.bind(reader);
-    reader.read = () => originalRead().then((result) => {
-      if (!result.done) resetIdleTimeout();
-      return result;
-    });
-    res.body = new ReadableStream({
-      pull(controller) {
-        return reader.read().then(
-          ({ done, value }) => {
-            if (done) {
-              controller.close();
-              clearTimeout(timer);
-            } else {
-              controller.enqueue(value);
-            }
-          },
-          (err) => {
-            clearTimeout(timer);
-            throw err;
-          }
-        );
-      },
-      cancel(reason) {
-        clearTimeout(timer);
-        return reader.cancel(reason);
-      },
-    });
   }
 
   if (res.status === 429) {
@@ -175,7 +129,34 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     const text = await res.text();
     throw new GeminiError(`Gemini error ${res.status}: ${text}`, { status: res.status });
   }
-  return res;
+
+  // KHÔNG gán res.body (Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng).
+  // Trả object mới bọc stream, reset idle timeout mỗi chunk.
+  const reader = res.body.getReader();
+  const resetIdle = () => {
+    if (timedOut) return;
+    clearTimeout(timer);
+    timer = setTimeout(onTimeout, timeoutMs);
+  };
+  const wrapped = new ReadableStream({
+    async pull(ctrl) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) { clearTimeout(timer); ctrl.close(); return; }
+        resetIdle();
+        ctrl.enqueue(value);
+      } catch (err) {
+        clearTimeout(timer);
+        ctrl.error(timedOut ? new GeminiError(`Gemini stream idle timeout after ${timeoutMs}ms`, { status: 504 }) : err);
+      }
+    },
+    cancel(reason) {
+      clearTimeout(timer);
+      controller.abort();
+      return reader.cancel(reason).catch(() => {});
+    },
+  });
+  return { ok: res.ok, status: res.status, headers: res.headers, body: wrapped };
 }
 
 module.exports = { callGemini, callGeminiStream, Gemini429Error, GeminiError };

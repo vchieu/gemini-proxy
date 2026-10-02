@@ -33,9 +33,6 @@ function openAiToGemini(openAiRequestBody) {
       const text = Array.isArray(m.content)
         ? m.content.map((p) => (typeof p === 'string' ? p : p.text || '')).join('')
         : String(m.content ?? '');
-      systemInstruction = { role: 'user', parts: [{ text }] };
-      // tương đương: systemInstruction = { parts: [{text}] } cũng được chấp nhận;
-      // giữ dạng {parts} chuẩn Gemini:
       systemInstruction = { parts: [{ text }] };
     } else if (role === 'assistant') {
       contents.push({ role: 'model', parts: normalizeContent(m.content) });

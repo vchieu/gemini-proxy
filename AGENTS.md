@@ -43,11 +43,11 @@ Bản dịch format nằm ở `api/translate.js` (`openAiToGemini`, `geminiToOpe
 |---|---|---|
 | Bootstrap | `index.js` | `main()` — load config → `StateStore` → `createServer` → `listen` |
 | Config Loader | `config/loader.js` | `loadConfig(configDir) → { keys, models, settings }` |
-| State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()` (atomic write qua .tmp + rename; lược bỏ inflight — transient), `reserve(k,m,est)`, `release(k,m,est)`, `resetDailyIfNeeded(k,m,now)`, `minCooldownRemaining(now)`, `snapshot()` |
+| State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()` (atomic write qua .tmp + rename; lược bỏ inflight — transient), `reserve(k,m,est)`, `release(k,m,est)`, `resetDailyIfNeeded(k,m,now)`, `minCooldownRemaining(now)`, `snapshot()`, `flush()` (huỷ debounce + persist, dùng khi SIGINT/SIGTERM) |
 | Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` (THUẦN, không mutate pairState; cộng `inflight_count`/`inflight_tokens` vào RPD/RPM/TPM — edge case #3). Reset daily_count gọi riêng qua `StateStore.resetDailyIfNeeded(k,m,now)` |
 | Selector | `router/selector.js` | `selectPair(..., strategy?)` (thuần, không side-effect; `strategy: 'round_robin_key_then_model' \| 'priority_model_first'`) + `selectAndReserve(..., strategy?)` (select + `reserve` nguyên tử, caller BẮT BUỘC `release` mọi nhánh kết thúc) → `SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
-| Fallback | `router/fallbackLoop.js` | `handleRequest(agentRequest, { models, keys, stateStore, geminiClient, config }) → Promise<{ openAiResponse, usedKeyId, usedModel, attempts }>`; `class Aggregated429Error` |
-| Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)` (idle timeout cover cả stream body); `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
+| Fallback | `router/fallbackLoop.js` | `handleRequest(agentRequest, { models, keys, stateStore, geminiClient, config }) → Promise<{ openAiResponse, usedKeyId, usedModel, attempts }>`; `openStream(agentRequest, deps) → Promise<{ upstream, pair, estimated, release }>` (fallback 429 ở giai đoạn mở stream, caller phải `release()`); `class Aggregated429Error` |
+| Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)` trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc, vì `Response.body` không gán được); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
 | API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app` |
 | Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, model, streamId, created)` |
@@ -67,7 +67,7 @@ Quy tắc:
 1. Đọc AGENTS.md + file liên quan (xem §1).
 2. Chạy test baseline trước khi sửa: `node --test tests/*.test.js` (hoặc `npm test`, tương đương).
 3. Sửa code theo đúng contract §3 và thuật toán `gemini-proxy-plan.md` §6.
-4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`26/26` tại thời điểm fix edge case #3; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM).
+4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`35/35` tại thời điểm fix streaming fallback + shutdown flush; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM, `tests/streaming.test.js` khóa fallback 429 + client disconnect, `tests/geminiStream.test.js` khóa real Response body).
 5. Smoke-test server nếu đụng tới `api/`, `index.js`, `config/`: `node index.js` rồi kiểm tra
    `GET /health`, `GET /v1/models`, `GET /admin/status`, `POST /v1/chat/completions` (case thiếu `messages` phải 400).
 6. Cập nhật tài liệu theo §5 **trong cùng một change** — PR/change thiếu doc update được coi là chưa xong.
@@ -108,7 +108,7 @@ phải nêu rõ lý do trong báo cáo thay vì im lặng bỏ qua.
 4. Reset ngày theo PT (`utils/time.js`), không dùng giờ local.
 5. Lỗi non-429 (network/5xx) → trả lỗi ngay, không tính quota, không set cooldown.
 6. `respect_agent_model=true` mới tôn trọng model agent gửi; mặc định `false` (proxy tự chọn, `model: "auto"`).
-7. Streaming: kiểm tra limit **trước** khi mở stream; 429 giữa stream thì đóng stream kèm lỗi (không retry ngầm). Stream bị interrupt (lỗi network, client disconnect) thì KHÔNG recordSuccess và KHÔNG ghi `[DONE]` — chỉ record khi stream hoàn tất nguyên vẹn. Timeout cover cả stream body (idle timeout), không chỉ lúc kết nối ban đầu.
+7. Streaming: kiểm tra limit **trước** khi mở stream; fallback 429 được thực hiện trước khi gửi byte đầu; 429 giữa stream thì đóng stream kèm lỗi (không retry ngầm). Stream bị interrupt (lỗi network, client disconnect) thì KHÔNG recordSuccess và KHÔNG ghi `[DONE]` — chỉ record khi stream hoàn tất nguyên vẹn. Timeout cover cả stream body (idle timeout), không chỉ lúc kết nối ban đầu.
 
 ## 7. Cấm kỵ
 
