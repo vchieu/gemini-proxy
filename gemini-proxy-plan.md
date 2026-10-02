@@ -48,7 +48,7 @@ agent → POST /v1/chat/completions (stream: true)
 | Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)` trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc, vì `Response.body` không gán được); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
 | API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app` |
-| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, modelId, streamId, created)` |
+| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, modelName, streamId, created, toolCallIndexOffset?)`; tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse` |
 | Token estimate | `utils/tokenEstimate.js` | `estimateTokens(messages) → number` (heuristic chars/4 + 4 token overhead/message) |
 | Time | `utils/time.js` | `nextMidnightPacific(nowMs) → ms` |
 | Logger | `utils/logger.js` | `logger.{debug,info,warn,error}`, `createLogger(level)` |
@@ -103,8 +103,13 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 
 - **Request:** `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`.
 - **Assistant response:** `tool_calls` → `functionCall` parts.
-- **Tool result:** `role: "tool"` → `functionResponse` parts.
-- **Response:** `functionCall` → `tool_calls`, `finish_reason: "tool_calls"`.
+- **Tool result:** `role: "tool"` → `functionResponse` parts. `extractToolName` ưu tiên parse tên
+  từ `tool_call_id` (id do `makeToolCallId` tạo, nhúng tên function đã encode); fallback FIFO
+  (functionCall chưa respond gần nhất theo document) — cần cho parallel tool_calls, nếu không
+  mọi tool result sẽ map về tên ĐẦU TIÊN.
+- **Response:** `functionCall` → `tool_calls`, `finish_reason: "tool_calls"`. Streaming:
+  `delta.tool_calls[i]` kèm `index` tăng dần giữa các chunk (tham số `toolCallIndexOffset`,
+  `server.js` giữ counter) — OpenAI spec bắt buộc `index`, client gom delta theo index.
 
 ## 5. Edge cases
 
@@ -164,7 +169,7 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 
 | Method | Path | Mô tả |
 |---|---|---|
-| POST | `/v1/chat/completions` | OpenAI-compatible chat (hỗ trợ `stream: true` SSE) |
+| POST | `/v1/chat/completions` | OpenAI-compatible chat (hỗ trợ `stream: true` SSE, tool/function-calling) |
 | GET | `/v1/models` | Danh sách model đang cấu hình |
 | GET | `/admin/status` | Debug: quota đã dùng / còn lại từng cặp (key, model) |
 | GET | `/health` | Health check |
@@ -175,4 +180,4 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 npm test
 ```
 
-Kỳ vọng: **40/40 pass** (2026-10-02, gồm tool/function-calling tests).
+Kỳ vọng: **43/43 pass** (2026-10-02, gồm tool/function-calling tests — bổ sung parallel tool_calls + streaming tool_calls index).

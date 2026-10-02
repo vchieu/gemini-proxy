@@ -27,7 +27,7 @@ npm start
 
 | Method | Path | Mô tả |
 |---|---|---|
-| POST | `/v1/chat/completions` | OpenAI-compatible chat (hỗ trợ `stream: true` SSE) |
+| POST | `/v1/chat/completions` | OpenAI-compatible chat (hỗ trợ `stream: true` SSE, tool/function-calling: `tools`, `tool_choice`, `tool_calls`) |
 | GET | `/v1/models` | Danh sách model đang cấu hình |
 | GET | `/admin/status` | Debug: quota đã dùng / còn lại từng cặp (key, model) |
 | GET | `/health` | Health check |

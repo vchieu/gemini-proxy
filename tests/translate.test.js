@@ -1,6 +1,6 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { openAiToGemini, geminiToOpenAi } = require('../api/translate');
+const { openAiToGemini, geminiToOpenAi, geminiChunkToOpenAiChunk } = require('../api/translate');
 const { estimateTokens } = require('../utils/tokenEstimate');
 const { nextMidnightPacific } = require('../utils/time');
 
@@ -97,6 +97,69 @@ describe('translate', () => {
     assert.equal(oai.choices[0].message.tool_calls[0].function.name, 'get_weather');
     assert.equal(oai.choices[0].message.tool_calls[0].function.arguments, '{"city":"HN"}');
     assert.equal(oai.choices[0].finish_reason, 'tool_calls');
+  });
+
+  it('resolves PARALLEL tool calls to correct function names (id roundtrip)', () => {
+    // Gemini trả 2 functionCall song song trong 1 response
+    const oai = geminiToOpenAi({
+      candidates: [{
+        content: { parts: [
+          { functionCall: { name: 'get_weather', args: { city: 'HN' } } },
+          { functionCall: { name: 'get_time', args: {} } },
+        ] },
+        finishReason: 'STOP',
+      }],
+    }, 'gemini-2.5-flash');
+    const tcs = oai.choices[0].message.tool_calls;
+    assert.equal(tcs.length, 2);
+
+    // Client echo lại id + kết quả theo thứ tự tool_calls
+    const g = openAiToGemini({
+      messages: [
+        { role: 'user', content: 'weather & time?' },
+        { role: 'assistant', content: null, tool_calls: tcs },
+        { role: 'tool', tool_call_id: tcs[0].id, content: '{"temp":25}' },
+        { role: 'tool', tool_call_id: tcs[1].id, content: '07:00' },
+      ],
+    });
+    const responses = g.contents
+      .filter((c) => c.parts.some((p) => p.functionResponse))
+      .map((c) => c.parts.find((p) => p.functionResponse).functionResponse.name);
+    assert.deepEqual(responses, ['get_weather', 'get_time']);
+  });
+
+  it('falls back to FIFO when tool_call_id has no embedded name (old format)', () => {
+    const g = openAiToGemini({
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: '', tool_calls: [
+          { id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' } },
+          { id: 'call_2', type: 'function', function: { name: 'get_time', arguments: '{}' } },
+        ] },
+        { role: 'tool', tool_call_id: 'call_1', content: '25' },
+        { role: 'tool', tool_call_id: 'call_2', content: '07:00' },
+      ],
+    });
+    const responses = g.contents
+      .filter((c) => c.parts.some((p) => p.functionResponse))
+      .map((c) => c.parts.find((p) => p.functionResponse).functionResponse.name);
+    assert.deepEqual(responses, ['get_weather', 'get_time']);
+  });
+
+  it('adds required index to streaming tool_calls deltas (cumulative across chunks)', () => {
+    const mkChunk = (name, offset) => geminiChunkToOpenAiChunk({
+      candidates: [{ content: { parts: [{ functionCall: { name, args: {} } }] }, finishReason: 'STOP' }],
+    }, 'gemini-2.5-flash', 'chatcmpl-x', 1, offset);
+
+    const c1 = mkChunk('get_weather', 0);
+    assert.equal(c1.choices[0].delta.tool_calls[0].index, 0);
+    assert.equal(c1.choices[0].finish_reason, 'tool_calls');
+
+    const c2 = mkChunk('get_time', 1);
+    assert.equal(c2.choices[0].delta.tool_calls[0].index, 1);
+    // backward-compat: không truyền offset vẫn mặc định 0
+    const c3 = mkChunk('get_weather');
+    assert.equal(c3.choices[0].delta.tool_calls[0].index, 0);
   });
 });
 

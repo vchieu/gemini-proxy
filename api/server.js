@@ -105,6 +105,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     const streamId = `chatcmpl-${Date.now().toString(36)}`;
     const created = Math.floor(Date.now() / 1000);
     let totalTokens = handle.estimated;
+    let toolCallIndex = 0; // offset index tool_calls giữa các chunk (OpenAI streaming yêu cầu index tăng dần)
     let streamCompleted = false;
     let clientAborted = false;
     let streamError = null;
@@ -124,7 +125,9 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       try {
         const g = JSON.parse(payload);
         if (g.usageMetadata && g.usageMetadata.totalTokenCount) totalTokens = g.usageMetadata.totalTokenCount;
-        res.write(`data: ${JSON.stringify(geminiChunkToOpenAiChunk(g, pair.model.name, streamId, created))}\n\n`);
+        const out = geminiChunkToOpenAiChunk(g, pair.model.name, streamId, created, toolCallIndex);
+        toolCallIndex += (out.choices[0] && out.choices[0].delta.tool_calls ? out.choices[0].delta.tool_calls.length : 0);
+        res.write(`data: ${JSON.stringify(out)}\n\n`);
       } catch (_) { /* bỏ qua chunk không parse được */ }
     };
 

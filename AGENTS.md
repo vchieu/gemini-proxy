@@ -9,7 +9,7 @@
 Trước khi nhận task, đọc theo thứ tự:
 
 1. `AGENTS.md` (file này) — nắm luật và kiến trúc.
-2. `gemini-proxy-plan.md` — spec đầy đủ (§5 skeleton/signature, §6 thuật toán, §10 edge cases).
+2. `gemini-proxy-plan.md` — spec đầy đủ (§3 contract module, §4 thuật toán, §5 edge cases).
 3. `types.js` — các typedef dùng chung (`ApiKeyConfig`, `ModelConfig`, `ModelLimits`, `PairState`, `SelectedPair`).
 4. Module liên quan trực tiếp tới task (xem bảng §3).
 5. `config/keys.json`, `config/models.json`, `config/config.json` — nếu task đụng tới config/quota.
@@ -50,7 +50,7 @@ Bản dịch format nằm ở `api/translate.js` (`openAiToGemini`, `geminiToOpe
 | Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)` trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc, vì `Response.body` không gán được); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
 | API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app` |
-| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, model, streamId, created)`; hỗ trợ tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse` |
+| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, model, streamId, created, toolCallIndexOffset?)`; hỗ trợ tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse`; `tool_call_id` nhúng tên function (FIFO fallback — đúng với parallel tool_calls); streaming `tool_calls` có `index` tăng dần giữa các chunk |
 | Token estimate | `utils/tokenEstimate.js` | `estimateTokens(messages) → number` (heuristic chars/4 + 4 token overhead/message) |
 | Time | `utils/time.js` | `nextMidnightPacific(nowMs) → ms` |
 | Logger | `utils/logger.js` | `logger.{debug,info,warn,error}`, `createLogger(level)` |
@@ -66,8 +66,8 @@ Quy tắc:
 
 1. Đọc AGENTS.md + file liên quan (xem §1).
 2. Chạy test baseline trước khi sửa: `node --test tests/*.test.js` (hoặc `npm test`, tương đương).
-3. Sửa code theo đúng contract §3 và thuật toán `gemini-proxy-plan.md` §6.
-4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`40/40` tại thời điểm implement tool/function-calling; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM, `tests/streaming.test.js` khóa fallback 429 + client disconnect, `tests/geminiStream.test.js` khóa real Response body, `tests/translate.test.js` khóa tool/function-calling).
+3. Sửa code theo đúng contract §3 và thuật toán `gemini-proxy-plan.md` §4.
+4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`43/43` tại thời điểm fix parallel tool_calls + streaming tool_calls index; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM, `tests/streaming.test.js` khóa fallback 429 + client disconnect, `tests/geminiStream.test.js` khóa real Response body, `tests/translate.test.js` khóa tool/function-calling — kể cả parallel và streaming index).
 5. Smoke-test server nếu đụng tới `api/`, `index.js`, `config/`: `node index.js` rồi kiểm tra
    `GET /health`, `GET /v1/models`, `GET /admin/status`, `POST /v1/chat/completions` (case thiếu `messages` phải 400).
 6. Cập nhật tài liệu theo §5 **trong cùng một change** — PR/change thiếu doc update được coi là chưa xong.
@@ -100,7 +100,7 @@ Quy tắc:
 Nếu câu trả lời cho bất kỳ thay đổi user-visible/contract nào là "docs chưa cần update",
 phải nêu rõ lý do trong báo cáo thay vì im lặng bỏ qua.
 
-## 6. Edge cases không được quên (§10 của plan)
+## 6. Edge cases không được quên (§5 của plan)
 
 1. Tất cả cặp cooldown → 429 tổng hợp + header `Retry-After` = cooldown ngắn nhất.
 2. Request ước lượng vượt TPM mọi model → lỗi rõ ràng, không loop vô hạn.

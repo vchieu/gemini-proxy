@@ -126,14 +126,40 @@ function openAiToGemini(openAiRequestBody) {
   return out;
 }
 
-/** Trích xuất tên function từ tool_call_id hoặc tìm trong contents */
+/**
+ * Trích xuất tên function cho 1 tool result.
+ * Ưu tiên parse từ tool_call_id (makeToolCallId đã nhúng tên function).
+ * FIFO fallback: trả về tên functionCall CHƯA được respond gần nhất theo thứ tự
+ * document — quan trọng khi assistant có NHIỀU functionCall (parallel tool_calls),
+ * nếu không mọi tool result sẽ map về tên ĐẦU TIÊN.
+ */
 function extractToolName(toolCallId, toolMsg, contents) {
-  // tool_call_id thường dạng "call_<hash>" — không chứa tên function
-  // Tìm trong contents: functionCall gần nhất chưa được respond
-  for (let i = contents.length - 1; i >= 0; i--) {
-    const parts = contents[i].parts || [];
-    for (const p of parts) {
-      if (p.functionCall) return p.functionCall.name;
+  const fromId = nameFromToolCallId(toolCallId);
+  if (fromId) {
+    for (const c of contents) {
+      for (const p of c.parts || []) {
+        if (p.functionCall && p.functionCall.name === fromId) return fromId;
+      }
+    }
+  }
+  // pending = số lần gọi - số lần đã respond, theo từng tên function
+  const pending = new Map();
+  for (const c of contents) {
+    for (const p of c.parts || []) {
+      if (p.functionCall) pending.set(p.functionCall.name, (pending.get(p.functionCall.name) || 0) + 1);
+      else if (p.functionResponse) {
+        const n = pending.get(p.functionResponse.name) || 0;
+        if (n > 0) pending.set(p.functionResponse.name, n - 1);
+      }
+    }
+  }
+  for (const c of contents) {
+    for (const p of c.parts || []) {
+      const n = p.functionCall ? pending.get(p.functionCall.name) || 0 : 0;
+      if (n > 0) {
+        pending.set(p.functionCall.name, n - 1);
+        return p.functionCall.name;
+      }
     }
   }
   return undefined;
@@ -155,13 +181,26 @@ function mapFinishReason(fr) {
   }
 }
 
+/** Tạo tool_call_id — nhúng tên function (encoded) để map lại đúng khi client trả tool result, kể cả parallel/out-of-order */
+function makeToolCallId(name) {
+  return `call_${encodeURIComponent(name)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** Đọc tên function từ tool_call_id do makeToolCallId tạo; trả undefined với id kiểu cũ (call_<hash>) */
+function nameFromToolCallId(toolCallId) {
+  if (typeof toolCallId !== 'string') return undefined;
+  const m = /^call_(.+)_([a-z0-9]{2,16})$/.exec(toolCallId);
+  if (!m) return undefined;
+  try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; }
+}
+
 /** Chuyển Gemini functionCall sang OpenAI tool_calls */
 function extractToolCalls(parts) {
   const toolCalls = [];
   for (const p of parts) {
     if (p.functionCall) {
       toolCalls.push({
-        id: `call_${Math.random().toString(36).slice(2, 10)}`,
+        id: makeToolCallId(p.functionCall.name),
         type: 'function',
         function: {
           name: p.functionCall.name,
@@ -208,8 +247,8 @@ function geminiToOpenAi(geminiResponseBody, modelName) {
   };
 }
 
-/** Dịch 1 chunk Gemini streaming sang chunk OpenAI SSE */
-function geminiChunkToOpenAiChunk(geminiChunk, modelName, streamId, created) {
+/** Dịch 1 chunk Gemini streaming sang chunk OpenAI SSE. `toolCallIndexOffset`: index bắt đầu của tool_calls (tăng dần giữa các chunk — OpenAI streaming yêu cầu index duy nhất) */
+function geminiChunkToOpenAiChunk(geminiChunk, modelName, streamId, created, toolCallIndexOffset = 0) {
   const candidates = geminiChunk.candidates || [];
   const first = candidates[0] || {};
   const parts = first?.content?.parts || [];
@@ -227,7 +266,7 @@ function geminiChunkToOpenAiChunk(geminiChunk, modelName, streamId, created) {
         delta: {
           role: 'assistant',
           content: text || null,
-          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+          ...(toolCalls ? { tool_calls: toolCalls.map((tc, i) => ({ index: toolCallIndexOffset + i, ...tc })) } : {}),
         },
         finish_reason: toolCalls ? 'tool_calls' : finish,
       },
