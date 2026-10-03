@@ -5,9 +5,11 @@
  * @returns {number} timestamp ms
  */
 function zonedTimeToUtcMs(year, month, day, hour, minute, second, timeZone) {
+  // Fallback an toàn nếu tham số không hợp lệ hoặc Date.UTC trả NaN
+  let guess = Date.UTC(year, month - 1, day, hour, minute, second);
+  if (Number.isNaN(guess)) return Date.now();
   // Thuật toán: đoán UTC = Date.UTC(...), rồi hiệu chỉnh bằng offset thực tế.
   // Lặp 2 lần để hội tụ qua biên DST.
-  let guess = Date.UTC(year, month - 1, day, hour, minute, second);
   for (let i = 0; i < 3; i++) {
     const fmt = new Intl.DateTimeFormat('en-US', {
       timeZone,

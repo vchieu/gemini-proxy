@@ -370,27 +370,6 @@ function extractToolCalls(parts) {
   }
   return toolCalls.length > 0 ? toolCalls : undefined;
 }
-function extractToolCalls(parts) {
-  const sigPool = parts
-    .filter((p) => p.thoughtSignature !== undefined && !p.functionCall)
-    .map((p) => normalizeThoughtSignature(p.thoughtSignature))
-    .filter((s) => s !== null);
-  const toolCalls = [];
-  for (const p of parts) {
-    if (p.functionCall) {
-      const thoughtSignature = normalizeThoughtSignature(p.thoughtSignature) || sigPool.shift();
-      toolCalls.push({
-        id: makeToolCallId(p.functionCall.name, thoughtSignature),
-        type: 'function',
-        function: {
-          name: p.functionCall.name,
-          arguments: JSON.stringify(p.functionCall.args || {}),
-        },
-      });
-    }
-  }
-  return toolCalls.length > 0 ? toolCalls : undefined;
-}
 
 /** @param {object} geminiResponseBody @param {string} modelName @returns {object} openAiResponseBody */
 function geminiToOpenAi(geminiResponseBody, modelName) {

@@ -111,18 +111,21 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
   }
 
-  if (res.status === 429) {
+  if (res.status === 429 || res.status === 403) {
     clearTimeout(timer);
     const text = await res.text();
     let body;
     try { body = JSON.parse(text); } catch (_) { body = { error: { message: text } }; }
     const msg = body?.error?.message || text;
-    throw new Gemini429Error(msg, {
-      rawMessage: msg,
-      details: body?.error?.details,
-      retryDelaySeconds: extractRetryDelaySeconds(body),
-      status: 429,
-    });
+    const isQuota = /quota|rate|limit|retry/i.test(msg);
+    if (res.status === 429 || isQuota) {
+      throw new Gemini429Error(msg, {
+        rawMessage: msg,
+        details: body?.error?.details,
+        retryDelaySeconds: extractRetryDelaySeconds(body?.error ? body : { error: { message: msg, details: body?.error?.details } }),
+        status: 429,
+      });
+    }
   }
   if (!res.ok) {
     clearTimeout(timer);
