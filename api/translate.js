@@ -21,6 +21,52 @@ function normalizeContent(content) {
 }
 
 /** Chuyển OpenAI tools/tool_choice sang Gemini functionDeclarations/toolConfig */
+
+// Whitelist field mà Gemini `Schema` chấp nhận (subset OpenAPI 3.0 — xem
+// https://ai.google.dev/api/generate-content#v1beta.Schema).
+// Agent (OpenCode/Cline) gửi JSON Schema đầy đủ với additionalProperties,
+// exclusiveMinimum, $schema, $defs... -> Gemini trả 400 "Unknown name ..." -> PHẢI lọc.
+const GEMINI_SCHEMA_KEYS = new Set([
+  'type', 'format', 'title', 'description', 'nullable', 'enum',
+  'maxItems', 'minItems', 'properties', 'required', 'minProperties', 'maxProperties',
+  'minLength', 'maxLength', 'pattern', 'example', 'anyOf', 'propertyOrdering',
+  'default', 'items', 'minimum', 'maximum',
+]);
+// Field có giá trị tùy ý (không phải sub-schema) -> giữ nguyên, không recurse
+const GEMINI_SCHEMA_RAW_KEYS = new Set(['example', 'default', 'enum']);
+
+/**
+ * Lọc schema JSON về đúng format Gemini, đệ quy qua properties/items/anyOf.
+ * - Bỏ mọi field ngoài whitelist (additionalProperties, exclusiveMinimum, $schema, $defs, $ref, const, ...)
+ * - `oneOf` chuyển thành `anyOf` (Gemini chỉ có anyOf)
+ * @param {*} value sub-schema (hoặc giá trị bất kỳ)
+ * @param {string} [key] tên field chứa value này
+ */
+function sanitizeGeminiSchema(value, key) {
+  if (GEMINI_SCHEMA_RAW_KEYS.has(key)) return value;
+  if (Array.isArray(value)) return value.map((v) => sanitizeGeminiSchema(v));
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (k === 'properties') {
+      // properties là map "tên field" -> schema, không phải schema -> recurse từng value
+      const src = v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+      const props = {};
+      for (const [name, sub] of Object.entries(src)) props[name] = sanitizeGeminiSchema(sub);
+      out.properties = props;
+      continue;
+    }
+    if (k === 'oneOf' || k === 'anyOf') {
+      const list = Array.isArray(v) ? v.map((s) => sanitizeGeminiSchema(s)) : [sanitizeGeminiSchema(v)];
+      out.anyOf = (out.anyOf || []).concat(list);
+      continue;
+    }
+    if (!GEMINI_SCHEMA_KEYS.has(k)) continue;
+    out[k] = sanitizeGeminiSchema(v, k);
+  }
+  return out;
+}
+
 function translateTools(body) {
   const tools = body.tools;
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
@@ -31,7 +77,7 @@ function translateTools(body) {
       functionDeclarations.push({
         name: t.function.name,
         description: t.function.description || '',
-        parameters: t.function.parameters || { type: 'object', properties: {} },
+        parameters: sanitizeGeminiSchema(t.function.parameters || { type: 'object', properties: {} }),
       });
     }
   }

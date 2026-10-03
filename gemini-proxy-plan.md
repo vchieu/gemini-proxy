@@ -105,6 +105,15 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 ### 4.5 Tool/function-calling
 
 - **Request:** `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`.
+- **Schema tool (sanitize):** `parameters` đi qua whitelist Gemini `Schema`
+  (`type, format, title, description, nullable, enum, maxItems, minItems, properties,
+  required, minProperties, maxProperties, minLength, maxLength, pattern, example,
+  anyOf, propertyOrdering, default, items, minimum, maximum`) — đệ quy qua
+  `properties`/`items`. Mọi field khác bị bỏ (`additionalProperties`,
+  `exclusiveMinimum`, `$schema`, `$defs`, `$ref`, `const`...), `oneOf` → `anyOf`,
+  giá trị `example`/`default`/`enum` giữ nguyên. **Lý do:** test live với OpenCode
+  bị Gemini 400 `Unknown name "additionalProperties" at 'tools[0]...parameters'`
+  (agent gửi JSON Schema draft-07 đầy đủ, Gemini chỉ nhận subset OpenAPI 3.0).
 - **Assistant response:** `tool_calls` → `functionCall` parts.
 - **Tool result:** `role: "tool"` → `functionResponse` parts. `extractToolName` ưu tiên parse tên
   từ `tool_call_id` (id do `makeToolCallId` tạo, nhúng tên function đã encode); fallback FIFO

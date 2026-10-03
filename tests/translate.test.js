@@ -42,6 +42,48 @@ describe('translate', () => {
     assert.equal(g.tools[0].functionDeclarations[0].description, 'Get weather');
   });
 
+  it('strips JSON Schema keys Gemini does not support (nguyên nhân 400 Unknown name)', () => {
+    // Schema kiểu OpenCode/zod gửi lên: additionalProperties, exclusiveMinimum, $schema...
+    const g = openAiToGemini({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'f',
+          description: 'd',
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            $schema: 'http://json-schema.org/draft-07/schema',
+            $defs: { a: { type: 'string' } },
+            properties: {
+              n: { type: 'number', exclusiveMinimum: 0, minimum: 1 },
+              arr: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { x: { type: 'string' } } } },
+              u: { oneOf: [{ type: 'string' }, { type: 'number' }] },
+              meta: { type: 'object', example: { foo: 'bar' }, default: { keep: true } },
+            },
+            required: ['n'],
+          },
+        },
+      }],
+    });
+    const p = g.tools[0].functionDeclarations[0].parameters;
+    const json = JSON.stringify(p);
+    // các field Gemini trả 400 "Unknown name" phải bị loại, kể cả nested
+    assert.ok(!json.includes('additionalProperties'));
+    assert.ok(!json.includes('exclusiveMinimum'));
+    assert.ok(!json.includes('$schema'));
+    assert.ok(!json.includes('$defs'));
+    // giữ lại field hợp lệ
+    assert.equal(p.properties.n.minimum, 1);
+    assert.deepEqual(p.required, ['n']);
+    assert.equal(p.properties.arr.items.properties.x.type, 'string');
+    // oneOf -> anyOf (Gemini chỉ có anyOf), giá trị example/default giữ nguyên
+    assert.deepEqual(p.properties.u.anyOf, [{ type: 'string' }, { type: 'number' }]);
+    assert.deepEqual(p.properties.meta.example, { foo: 'bar' });
+    assert.deepEqual(p.properties.meta.default, { keep: true });
+  });
+
   it('translates tool_choice to toolConfig', () => {
     const g = openAiToGemini({
       messages: [{ role: 'user', content: 'hi' }],
