@@ -119,11 +119,15 @@ function openAiToGemini(openAiRequestBody) {
       if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
         for (const tc of m.tool_calls) {
           if (tc.type === 'function' && tc.function) {
+            // Gemini 3: functionCall replay BẮT BUỘC kèm thoughtSignature (else 400).
+            // Signature được nhúng trong tool_call_id khi trả response (makeToolCallId).
+            const thoughtSignature = thoughtSignatureFromToolCallId(tc.id);
             parts.push({
               functionCall: {
                 name: tc.function.name,
                 args: safeJsonParse(tc.function.arguments) || {},
               },
+              ...(thoughtSignature ? { thoughtSignature } : {}),
             });
           }
         }
@@ -227,17 +231,57 @@ function mapFinishReason(fr) {
   }
 }
 
-/** Tạo tool_call_id — nhúng tên function (encoded) để map lại đúng khi client trả tool result, kể cả parallel/out-of-order */
-function makeToolCallId(name) {
-  return `call_${encodeURIComponent(name)}_${Math.random().toString(36).slice(2, 10)}`;
+/**
+ * Tạo tool_call_id — nhúng tên function (encoded) để map lại đúng khi client trả
+ * tool result, kể cả parallel/out-of-order.
+ *
+ * Nếu có `thoughtSignature` (Gemini 3 bắt buộc replay khi gửi lại history functionCall
+ * — xem plan §4.5) thì nhúng luôn vào id dạng `callsig_<name>_<rand>_<sig>`:
+ * OpenAI format không có chỗ chứa signature và client không echo field lạ, nên id là
+ * kênh duy nhất sống sót qua cả restart proxy (không cần state).
+ */
+function makeToolCallId(name, thoughtSignature) {
+  const rand = Math.random().toString(36).slice(2, 10);
+  if (typeof thoughtSignature === 'string' && thoughtSignature.length > 0 && thoughtSignature.length <= 8192) {
+    // encodedName không còn '_' (đổi thành %5F) để parse không bị nhầm với rand/sig
+    const encName = encodeURIComponent(name).replace(/_/g, '%5F');
+    return `callsig_${encName}_${rand}_${thoughtSignature}`;
+  }
+  return `call_${encodeURIComponent(name)}_${rand}`;
 }
 
-/** Đọc tên function từ tool_call_id do makeToolCallId tạo; trả undefined với id kiểu cũ (call_<hash>) */
-function nameFromToolCallId(toolCallId) {
-  if (typeof toolCallId !== 'string') return undefined;
+/**
+ * Parse tool_call_id -> { name?, thoughtSignature? }.
+ * - Format mới `callsig_<encName>_<rand>_<sig>`: encName không chứa '_', nên tách từ trái là chắc chắn;
+ *   sig là đuôi nên chứa ký tự gì (kể cả '_') cũng không phá parse.
+ * - Format cũ `call_<encName>_<rand>` (id client tự tạo / không có signature): chỉ có name.
+ * - Không nhận diện được -> {} (caller rơi về FIFO như cũ).
+ */
+function parseToolCallId(toolCallId) {
+  if (typeof toolCallId !== 'string') return {};
+  const n = /^callsig_([^_]+)_([a-z0-9]{1,16})_(.+)$/.exec(toolCallId);
+  if (n) {
+    let name;
+    try { name = decodeURIComponent(n[1]); } catch (_) { name = n[1]; }
+    return { name, thoughtSignature: n[3] };
+  }
   const m = /^call_(.+)_([a-z0-9]{2,16})$/.exec(toolCallId);
-  if (!m) return undefined;
-  try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; }
+  if (m) {
+    let name;
+    try { name = decodeURIComponent(m[1]); } catch (_) { name = m[1]; }
+    return { name };
+  }
+  return {};
+}
+
+/** Đọc tên function từ tool_call_id; trả undefined với id không nhúng tên (call_1, hash...) */
+function nameFromToolCallId(toolCallId) {
+  return parseToolCallId(toolCallId).name;
+}
+
+/** Lấy thoughtSignature (nếu có) từ tool_call_id để gắn lại vào functionCall part khi replay history */
+function thoughtSignatureFromToolCallId(toolCallId) {
+  return parseToolCallId(toolCallId).thoughtSignature;
 }
 
 /** Chuyển Gemini functionCall sang OpenAI tool_calls */
@@ -246,7 +290,8 @@ function extractToolCalls(parts) {
   for (const p of parts) {
     if (p.functionCall) {
       toolCalls.push({
-        id: makeToolCallId(p.functionCall.name),
+        // thoughtSignature là field của Part (sibling của functionCall) — nhúng vào id
+        id: makeToolCallId(p.functionCall.name, p.thoughtSignature),
         type: 'function',
         function: {
           name: p.functionCall.name,

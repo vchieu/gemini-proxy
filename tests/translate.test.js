@@ -188,6 +188,53 @@ describe('translate', () => {
     assert.deepEqual(responses, ['get_weather', 'get_time']);
   });
 
+  it('roundtrips thoughtSignature qua tool_call id (Gemini 3 bắt buộc khi replay functionCall)', () => {
+    const SIG = 'EqoDCqcDAWkUfRN6Iv88+z/xA==';
+    // Response từ Gemini: thoughtSignature là field của Part, cùng part với functionCall
+    const oai = geminiToOpenAi({
+      candidates: [{
+        content: { parts: [{ functionCall: { name: 'shell', args: { cmd: 'ls' } }, thoughtSignature: SIG }] },
+        finishReason: 'STOP',
+      }],
+    }, 'gemini-3.8-flash');
+    const tc = oai.choices[0].message.tool_calls[0];
+    assert.ok(tc.id.startsWith('callsig_'), 'id phải mang prefix callsig_ khi có signature');
+
+    // Client echo nguyên id trong history -> proxy gắn lại signature khi build Gemini request
+    const g = openAiToGemini({
+      messages: [
+        { role: 'user', content: 'run ls' },
+        { role: 'assistant', content: null, tool_calls: [tc] },
+        { role: 'tool', tool_call_id: tc.id, content: 'file.txt' },
+      ],
+    });
+    const fcPart = g.contents.flatMap((c) => c.parts).find((p) => p.functionCall);
+    assert.ok(fcPart, 'phải có functionCall part');
+    assert.equal(fcPart.thoughtSignature, SIG, 'phải gắn lại thoughtSignature nguyên vẹn');
+    assert.equal(fcPart.functionCall.name, 'shell');
+    // functionResponse vẫn resolve đúng tên function từ id mới
+    const fr = g.contents.flatMap((c) => c.parts).find((p) => p.functionResponse);
+    assert.equal(fr.functionResponse.name, 'shell');
+  });
+
+  it('streaming chunk cũng nhúng thoughtSignature vào tool_call id', () => {
+    const SIG = 'stream-sig-abc+123/==';
+    const chunk = geminiChunkToOpenAiChunk({
+      candidates: [{
+        content: { parts: [{ functionCall: { name: 'get_weather', args: { city: 'HN' } }, thoughtSignature: SIG }] },
+        finishReason: 'STOP',
+      }],
+    }, 'gemini-3.8-flash', 'chatcmpl-x', 1, 0);
+    const tc = chunk.choices[0].delta.tool_calls[0];
+    assert.ok(tc.id.startsWith('callsig_'));
+    assert.ok(tc.id.endsWith(`_${SIG}`), 'signature phải nằm nguyên ở đuôi id');
+    // id không nhúng signature (2.5 không trả) -> format cũ, không regression
+    const noSig = geminiChunkToOpenAiChunk({
+      candidates: [{ content: { parts: [{ functionCall: { name: 'f', args: {} } }] }, finishReason: 'STOP' }],
+    }, 'gemini-2.5-flash', 'chatcmpl-x', 1, 0);
+    assert.ok(noSig.choices[0].delta.tool_calls[0].id.startsWith('call_'));
+  });
+
   it('adds required index to streaming tool_calls deltas (cumulative across chunks)', () => {
     const mkChunk = (name, offset) => geminiChunkToOpenAiChunk({
       candidates: [{ content: { parts: [{ functionCall: { name, args: {} } }] }, finishReason: 'STOP' }],
