@@ -1,2 +1,5 @@
 node_modules/
 data/state.json
+
+# Chứa API key thật — KHÔNG BAO GIỜ commit (dùng config/keys.example.json làm mẫu)
+config/keys.json

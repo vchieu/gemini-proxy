@@ -9,7 +9,11 @@ Tự xoay tua cặp `(API key, model)` khi gặp 429, agent không cần biết.
 
 ## Chạy
 
-1. Điền API key thật vào `config/keys.json`.
+1. Tạo file key từ mẫu rồi điền API key thật vào (file này nằm ngoài git, không bị commit):
+
+```bash
+cp config/keys.example.json config/keys.json   # Windows PowerShell: Copy-Item config/keys.example.json config/keys.json
+```
 2. Cài đặt & chạy:
 
 ```bash
@@ -34,7 +38,7 @@ npm start
 
 ## Cấu hình
 
-- `config/keys.json` — danh sách key (`id`, `api_key`, `enabled`).
+- `config/keys.json` — danh sách key (`id`, `api_key`, `enabled`). **Không nằm trong git** (đã `.gitignore`); tạo từ mẫu `config/keys.example.json`.
 - `config/models.json` — danh sách model (`name`, `priority` càng nhỏ càng ưu tiên, `limits: {rpm, rpd, tpm}`).
 - `config/config.json` — `port`, `strategy` (`round_robin_key_then_model` mặc định, hoặc `priority_model_first`), `state_file`, `log_level`, `request_timeout_ms`, `max_fallback_attempts`, `respect_agent_model`, `default_cooldown_seconds`.
 

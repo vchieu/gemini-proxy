@@ -3,6 +3,10 @@
 > **Mọi AI agent (và cả contributor người) PHẢI đọc file này trước khi sửa code.**
 > File này là source-of-truth về kiến trúc, contract module và quy trình làm việc.
 > Spec sản phẩm gốc: `gemini-proxy-plan.md`.
+>
+> ⛔ **RULE ĐỌC FILE NGAY TẠI ĐÂY:** AI **KHÔNG ĐƯỢC** mở/đọc `config/keys.json`
+> (file chứa API key thật, **không nằm trong git** — xem §7). Muốn biết cấu trúc
+> schema keys thì đọc `config/keys.example.json`.
 
 ## 1. Thứ tự đọc bắt buộc (reference order)
 
@@ -12,7 +16,9 @@ Trước khi nhận task, đọc theo thứ tự:
 2. `gemini-proxy-plan.md` — spec đầy đủ (§3 contract module, §4 thuật toán, §5 edge cases).
 3. `types.js` — các typedef dùng chung (`ApiKeyConfig`, `ModelConfig`, `ModelLimits`, `PairState`, `SelectedPair`).
 4. Module liên quan trực tiếp tới task (xem bảng §3).
-5. `config/keys.json`, `config/models.json`, `config/config.json` — nếu task đụng tới config/quota.
+5. `config/models.json`, `config/config.json` — nếu task đụng tới config/quota.
+   ⛔ KHÔNG đọc `config/keys.json` (file secret, đã bị ignore khỏi git); dùng
+   `config/keys.example.json` nếu cần xem cấu trúc field key.
 6. `tests/` — test tương ứng để biết hành vi kỳ vọng đã được khóa (lock) ở đâu.
 
 Không được suy đoán signature từ trí nhớ — luôn mở file nguồn để kiểm chứng.
@@ -60,7 +66,11 @@ Quy tắc:
 - **Không đổi tên file, tên hàm, tham số, kiểu trả về** nếu không có yêu cầu rõ ràng và không cập nhật toàn bộ caller + test + docs (xem §5).
 - Codebase dùng **CommonJS** (`require`/`module.exports`), Node `>= 18` (dùng `fetch` global). Không thêm dependency mới nếu stdlib giải quyết được.
 - `state/store.js` là single-process in-memory + persist JSON. Mọi mutation quota/cooldown phải đi qua `StateStore` để được `persist()`.
-- Không bao giờ commit API key thật. `config/keys.json` chỉ chứa placeholder.
+- Không bao giờ commit API key thật. `config/keys.json` chứa key thật của user
+  và **đã bị bỏ khỏi git** (`.gitignore`, chỉ còn `config/keys.example.json`
+  với placeholder được track) — không được `git add` lại file này.
+- ⛔ Không đọc/ mở/ in ra `config/keys.json` — file chứa secret; schema xem ở
+  `config/keys.example.json`.
 
 ## 4. Quy trình làm việc chuẩn
 
@@ -112,6 +122,10 @@ phải nêu rõ lý do trong báo cáo thay vì im lặng bỏ qua.
 
 ## 7. Cấm kỵ
 
+- ⛔ **KHÔNG đọc file `config/keys.json`** (dùng `read`/`grep`/`cat`/shell đều không).
+  File này chứa API key thật, nằm ngoài git. Mọi thao tác với schema key phải
+  dựa vào `config/keys.example.json` (placeholder). Không `git add` để đưa nó
+  quay lại index.
 - Không hardcode API key, không log nguyên `api_key` (chỉ log `key.id`).
 - Không `require` vòng tròn giữa `api/` ↔ `router/` ↔ `client/` (luồng phụ thuộc một chiều như §2).
 - Không sửa `config/*.json` mẫu thành key thật để "test cho tiện".
