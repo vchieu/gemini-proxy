@@ -21,6 +21,19 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
   const client = geminiClient || require('../client/geminiClient');
   const deps = { models, keys, stateStore, geminiClient: client, config };
   const app = express();
+
+  // Access log: method, path, status, duration. /health poll mỗi giây -> debug để không spam log.
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      const line = `${req.method} ${req.originalUrl} -> ${res.statusCode} ${Date.now() - start}ms`;
+      if (req.originalUrl.startsWith('/health')) logger.debug(line);
+      else if (res.statusCode >= 400) logger.warn(line);
+      else logger.info(line);
+    });
+    next();
+  });
+
   app.use(express.json({ limit: '10mb' }));
 
   app.get('/health', (req, res) => res.json({ status: 'ok' }));
@@ -157,6 +170,19 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       res.write(`data: ${JSON.stringify(errorToOpenAi(streamError.status || 502, streamError.message))}\n\n`);
     }
     return res.end();
+  });
+
+  // JSON hỏng / lỗi body-parser → trả JSON kiểu OpenAI, KHÔNG để Express default handler
+  // in HTML stack trace (lộ đường dẫn file nội bộ).
+  // eslint-disable-next-line no-unused-vars
+  app.use((err, req, res, next) => {
+    const status = Number.isInteger(err.status) ? err.status : 500;
+    if (status === 400) {
+      logger.warn(`Bad request body on ${req.method} ${req.originalUrl}: ${err.message}`);
+      return res.status(400).json(errorToOpenAi(400, `Invalid JSON body: ${err.message}`, 'invalid_request_error'));
+    }
+    logger.error(`Unhandled error on ${req.method} ${req.originalUrl}: ${err.stack || err.message}`);
+    return res.status(status).json(errorToOpenAi(status, err.message || 'Internal error'));
   });
 
   return app;

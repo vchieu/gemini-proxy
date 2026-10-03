@@ -36,6 +36,7 @@ agent → api/server.js → router/fallbackLoop.js → router/selector.js
   → state/cooldown.js (isAvailable) + state/store.js (StateStore)
   → client/geminiClient.js → Google API
   → 429? client/errorParser.js → store.setCooldown → chọn cặp khác (loop)
+  → 5xx upstream (500/502/503/504)? → chọn cặp khác NGAY (KHÔNG cooldown, KHÔNG tính quota)
   → thành công? store.recordSuccess → api/translate.js → trả OpenAI format
 ```
 
@@ -52,7 +53,7 @@ Bản dịch format nằm ở `api/translate.js` (`openAiToGemini`, `geminiToOpe
 | State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()` (atomic write qua .tmp + rename; lược bỏ inflight — transient), `reserve(k,m,est)`, `release(k,m,est)`, `resetDailyIfNeeded(k,m,now)`, `minCooldownRemaining(now)`, `snapshot()`, `flush()` (huỷ debounce + persist, dùng khi SIGINT/SIGTERM) |
 | Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` (THUẦN, không mutate pairState; cộng `inflight_count`/`inflight_tokens` vào RPD/RPM/TPM — edge case #3). Reset daily_count gọi riêng qua `StateStore.resetDailyIfNeeded(k,m,now)` |
 | Selector | `router/selector.js` | `selectPair(..., strategy?)` (thuần, không side-effect; `strategy: 'round_robin_key_then_model' \| 'priority_model_first'`) + `selectAndReserve(..., strategy?)` (select + `reserve` nguyên tử, caller BẮT BUỘC `release` mọi nhánh kết thúc) → `SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
-| Fallback | `router/fallbackLoop.js` | `handleRequest(agentRequest, { models, keys, stateStore, geminiClient, config }) → Promise<{ openAiResponse, usedKeyId, usedModel, attempts }>`; `openStream(agentRequest, deps) → Promise<{ upstream, pair, estimated, release }>` (fallback 429 ở giai đoạn mở stream, caller phải `release()`); `class Aggregated429Error` |
+| Fallback | `router/fallbackLoop.js` | `handleRequest(agentRequest, { models, keys, stateStore, geminiClient, config }) → Promise<{ openAiResponse, usedKeyId, usedModel, attempts }>`; `openStream(agentRequest, deps) → Promise<{ upstream, pair, estimated, release }>` (fallback 429/5xx ở giai đoạn mở stream, caller phải `release()`); `class Aggregated429Error`; chính sách fallback: **429** → set cooldown theo retryDelay, **HTTP 5xx upstream (500/502/503/504)** → fallback ngay không cooldown (xem §6.5), lỗi khác trả ngay |
 | Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)` trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc, vì `Response.body` không gán được); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError` |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
 | API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app` |
@@ -77,7 +78,7 @@ Quy tắc:
 1. Đọc AGENTS.md + file liên quan (xem §1).
 2. Chạy test baseline trước khi sửa: `node --test tests/*.test.js` (hoặc `npm test`, tương đương).
 3. Sửa code theo đúng contract §3 và thuật toán `gemini-proxy-plan.md` §4.
-4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`43/43` tại thời điểm fix parallel tool_calls + streaming tool_calls index; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM, `tests/streaming.test.js` khóa fallback 429 + client disconnect, `tests/geminiStream.test.js` khóa real Response body, `tests/translate.test.js` khóa tool/function-calling — kể cả parallel và streaming index).
+4. Chạy lại **toàn bộ** test suite sau khi sửa. Mọi test phải pass (`46/46` tại thời điểm thêm fallback cho HTTP 5xx upstream + JSON error middleware; gồm `tests/concurrency.test.js` khóa bail-out khi overshoot RPM, `tests/streaming.test.js` khóa fallback 429 + client disconnect, `tests/geminiStream.test.js` khóa real Response body, `tests/translate.test.js` khóa tool/function-calling — kể cả parallel và streaming index, `tests/selectorFallback.test.js` khóa fallback 429 + 5xx transient + timeout trả ngay).
 5. Smoke-test server nếu đụng tới `api/`, `index.js`, `config/`: `node index.js` rồi kiểm tra
    `GET /health`, `GET /v1/models`, `GET /admin/status`, `POST /v1/chat/completions` (case thiếu `messages` phải 400).
 6. Cập nhật tài liệu theo §5 **trong cùng một change** — PR/change thiếu doc update được coi là chưa xong.
@@ -116,7 +117,14 @@ phải nêu rõ lý do trong báo cáo thay vì im lặng bỏ qua.
 2. Request ước lượng vượt TPM mọi model → lỗi rõ ràng, không loop vô hạn.
 3. Single-process: mutation state qua `StateStore` (đồng bộ); không cache `PairState` ra biến ngoài rồi ghi đè. Chống race đồng thời bằng **inflight reservation**: `selectAndReserve()` giữ chỗ ngay khi chọn (đồng bộ, không `await` ở giữa), `isAvailable()` cộng inflight vào RPD/RPM/TPM, caller (`fallbackLoop`, streaming trong `server.js`) BẮT BUỘC `release()` mọi nhánh kết thúc; inflight không persist và reset về 0 khi load. Không được gọi `selectPair()` thuần rồi `await` trước khi `recordSuccess` trong flow mới.
 4. Reset ngày theo PT (`utils/time.js`), không dùng giờ local.
-5. Lỗi non-429 (network/5xx) → trả lỗi ngay, không tính quota, không set cooldown.
+5. Lỗi non-429 **khác 5xx** (4xx, timeout/network của proxy) → trả lỗi ngay, không tính quota, không set cooldown.
+   **Ngoại lệ (lệch plan §5.5 — lý do ở `gemini-proxy-plan.md` §5.5):** upstream trả
+   **HTTP 500/502/503/504** (503 "high demand" xảy ra thường xuyên với free tier) thì
+   `withFallback` fallback sang cặp khác **ngay**, bỏ qua toàn bộ key của model đó trong
+   request hiện tại, **không** set cooldown, **không** tính quota; hết cặp còn 5xx thì trả
+   lỗi 5xx gốc (không phải 429). Phân biệt bằng prefix message `Gemini error <status>:`
+   (chỉ sinh ra khi Google trả `!res.ok`) — timeout/network của `geminiClient` có message
+   `Gemini request timeout...` / `Gemini network error...` nên VẪN trả ngay như cũ.
 6. `respect_agent_model=true` mới tôn trọng model agent gửi; mặc định `false` (proxy tự chọn, `model: "auto"`).
 7. Streaming: kiểm tra limit **trước** khi mở stream; fallback 429 được thực hiện trước khi gửi byte đầu; 429 giữa stream thì đóng stream kèm lỗi (không retry ngầm). Stream bị interrupt (lỗi network, client disconnect) thì KHÔNG recordSuccess và KHÔNG ghi `[DONE]` — chỉ record khi stream hoàn tất nguyên vẹn. Timeout cover cả stream body (idle timeout), không chỉ lúc kết nối ban đầu.
 

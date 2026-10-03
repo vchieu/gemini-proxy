@@ -30,6 +30,21 @@ function is429(e) {
   return e instanceof Gemini429Error || e.name === 'Gemini429Error' || e.status === 429;
 }
 
+const TRANSIENT_UPSTREAM_STATUS = new Set([500, 502, 503, 504]);
+
+/**
+ * HTTP 5xx THẬT từ upstream (Google trả !res.ok) — lỗi tạm thời, nên thử cặp khác.
+ * Loại timeout/network của chính proxy ra khỏi nhóm này: geminiClient sinh message
+ * "Gemini request timeout..." / "Gemini network error..." nên không match prefix
+ * "Gemini error <status>:" (những lỗi đó vẫn trả ngay theo plan §5.5).
+ */
+function isTransientUpstream(e) {
+  return !!e
+    && TRANSIENT_UPSTREAM_STATUS.has(e.status)
+    && typeof e.message === 'string'
+    && e.message.startsWith('Gemini error ');
+}
+
 function retrySecondsOf(e, defaultCooldown) {
   let s = e.retryDelaySeconds;
   if (!Number.isFinite(s) || s <= 0) {
@@ -69,6 +84,7 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
 
   const triedPairs = [];
   let attempts = 0;
+  let lastTransient = null; // lỗi 5xx upstream gần nhất (nếu có)
 
   while (attempts < maxAttempts) {
     const now = Date.now();
@@ -76,6 +92,11 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
     const pair = selectAndReserve(candidateModels, keys, stateStore, now, estimated, triedPairs, config && config.strategy);
     if (!pair) {
       const waitMs = minCooldownRemainingMs(candidateModels, keys, stateStore, now);
+      if (lastTransient && waitMs === 0) {
+        // hết cặp là do đã thử tất cả và đều 5xx (không có cooldown 429 nào) -> trả lỗi 5xx gốc
+        logger.warn(`All pairs failed with transient upstream 5xx: ${lastTransient.message}`);
+        throw lastTransient;
+      }
       const retryAfter = Math.max(1, Math.ceil(waitMs / 1000));
       logger.warn('All pairs exhausted', { tried: triedPairs.length, retryAfter });
       throw new Aggregated429Error('Tất cả model/key đều đang bị giới hạn, vui lòng thử lại sau', retryAfter);
@@ -92,6 +113,16 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
         stateStore.setCooldown(pair.key.id, pair.model.name, Date.now() + Math.ceil(retrySeconds * 1000) + 500);
         logger.warn(`429 from key=${pair.key.id} model=${pair.model.name}, cooldown ${retrySeconds}s`, { msg: e.message });
         triedPairs.push(pair);
+        attempts += 1;
+        continue;
+      }
+      if (isTransientUpstream(e)) {
+        // Lệch plan §5.5 (ghi rõ ở AGENTS.md §6.5): 5xx upstream là lỗi tạm thời của
+        // model (overload/spikes) -> fallback sang cặp khác NGAY, không tính quota,
+        // không set cooldown. 5xx theo mình model -> loại hết key của model này trong request này.
+        logger.warn(`HTTP ${e.status} from key=${pair.key.id} model=${pair.model.name} (transient), thử cặp khác`, { msg: e.message });
+        for (const k of keys) if (k.enabled !== false) triedPairs.push({ key: k, model: pair.model });
+        lastTransient = e;
         attempts += 1;
         continue;
       }

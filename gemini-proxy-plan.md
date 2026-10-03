@@ -79,6 +79,9 @@ while (attempts < maxAttempts):
     attempts++
   catch non-429:
     release(pair)
+    if là HTTP 500/502/503/504 từ upstream (message "Gemini error <status>:"):
+      triedPairs += mọi cặp của model này   // fallback request này, KHÔNG cooldown
+      lastTransient = e; attempts++; continue
     throw
 throw Aggregated429Error("Đã thử hết số lần fallback")
 ```
@@ -118,6 +121,12 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 3. **Race đồng thời** — inflight reservation: `selectAndReserve()` giữ chỗ ngay khi chọn, `isAvailable()` cộng inflight vào RPD/RPM/TPM.
 4. **Reset ngày theo PT** — `utils/time.js`, không dùng giờ local.
 5. **Lỗi non-429** → trả lỗi ngay, không tính quota, không set cooldown.
+   **Lệch spec (đã sửa sau khi test live, lý do ghi tại đây):** upstream trả
+   **HTTP 500/502/503/504** được coi là lỗi tạm thời (overload/spikes — test live thấy
+   `gemini-3.8-flash` trả 503 "high demand" lặp lại dù 3 model khác vẫn chạy được) nên
+   `withFallback` fallback sang cặp khác **ngay** (loại hết key của model 5xx trong
+   request đó), không tính quota, không set cooldown; hết cặp còn 5xx thì trả lỗi 5xx gốc.
+   Timeout/network của proxy và mọi lỗi 4xx vẫn trả ngay như spec. (Xem `AGENTS.md` §6.5.)
 6. **`respect_agent_model=true`** mới tôn trọng model agent gửi; mặc định `false`.
 7. **Streaming:**
    - Kiểm tra limit **trước** khi mở stream.
