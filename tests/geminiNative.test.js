@@ -141,4 +141,17 @@ describe('gemini-native route', () => {
     const res = await post(port, {});
     assert.ok(res.status === 200 || res.status === 400, 'should handle model names with dots and dashes');
   });
+
+  it('case 13: stream native - SSE forward nguyên bản, không [DONE], response PHẢI kết thúc', async () => {
+    const res = await Promise.race([
+      postStream(port, {}),
+      delay(3000).then(() => {
+        throw new Error('stream response did not end — missing res.end() (client would hang forever)');
+      }),
+    ]);
+    assert.equal(res.status, 200);
+    assert.ok(res.body.includes('data:'), 'should forward SSE bytes natively');
+    assert.ok(res.body.includes('streamed'), 'should contain upstream text');
+    assert.ok(!res.body.includes('[DONE]'), 'native Gemini stream must not have [DONE]');
+  });
 });

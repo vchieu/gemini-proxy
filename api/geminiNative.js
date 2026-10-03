@@ -37,7 +37,7 @@ function createGeminiNativeRouter(deps) {
         return res.json(r.geminiResponse);
       } catch (e) { return sendGeminiError(res, e, config); }
     }
-    return streamNative(req, res, parsed.model, body, deps);
+    return streamNative(req, res, parsed.model, body, deps).catch((e) => sendGeminiError(res, e, config));
   });
 
   // GET /models at /v1beta only - minimal list
@@ -64,6 +64,15 @@ function createGeminiNativeRouter(deps) {
 async function streamNative(req, res, requestedModel, body, deps) {
   const { upstream, pair, estimated, release } = await openNativeStream(requestedModel, body, deps);
   const { stateStore } = deps;
+
+  // Lấy reader TRƯỚC khi ghi header — nếu fail thì trả lỗi JSON được (chưa writeHead)
+  let reader;
+  try {
+    reader = upstream.body.getReader();
+  } catch (e) {
+    release();
+    return sendGeminiError(res, e, deps.config);
+  }
 
   let totalTokens = estimated;
   let clientAborted = false;
@@ -106,8 +115,6 @@ async function streamNative(req, res, requestedModel, body, deps) {
     if (l.startsWith('data:')) dataLines.push(l.slice(5).replace(/^ /, ''));
   };
 
-  const reader = upstream.body.getReader();
-
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -146,6 +153,8 @@ async function streamNative(req, res, requestedModel, body, deps) {
     if (!clientAborted && streamCompleted) {
       stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
     }
+    // KHÔNG được quên res.end() — nếu không client treo vô hạn chờ kết thúc SSE
+    if (!res.writableEnded && !res.destroyed) res.end();
   }
 }
 
