@@ -77,10 +77,10 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
     }
   }
   if (!res.ok) {
-    const msg = body?.error?.message || text || `HTTP ${res.status}`;
-    const err = new GeminiError(`Gemini error ${res.status}: ${msg}`, { status: res.status, body });
-    err.rawBody = body;
-    throw err;
+    clearTimeout(timer);
+    const text = await res.text();
+    let parsed; try { parsed = JSON.parse(text); } catch (_) { parsed = undefined; }
+    throw new GeminiError(`Gemini error ${res.status}: ${text}`, { status: res.status, body: parsed });
   }
   return body;
 }

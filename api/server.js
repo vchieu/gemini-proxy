@@ -36,6 +36,14 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
 
   app.use(express.json({ limit: '10mb' }));
 
+  // Che key= trong originalUrl access log de bao mat api key tu client (?key=... hoac x-goog-api-key)
+  app.use((req, res, next) => {
+    if (req.originalUrl) {
+      req.originalUrl = req.originalUrl.replace(/([?&]key=)[^&]*/i, '$1***');
+    }
+    next();
+  });
+
   app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
   app.get('/v1/models', (req, res) => {
@@ -74,6 +82,14 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     }
     res.json({ now, strategy: config.strategy, pairs });
   });
+
+  // Mount Gemini-native router at /v1beta
+  // - POST /v1beta/models/:modelAction (generateContent, streamGenerateContent)
+  // - GET /v1beta/models (danh sách model)
+  // Routes at /v1 are reserved for OpenAI-compatible endpoints only.
+  const { createGeminiNativeRouter } = require('./geminiNative');
+  const nativeRouter = createGeminiNativeRouter(deps);
+  app.use('/v1beta', nativeRouter);
 
   app.post('/v1/chat/completions', async (req, res) => {
     const agentRequest = req.body || {};

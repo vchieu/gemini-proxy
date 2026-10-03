@@ -59,7 +59,7 @@ function retrySecondsOf(e, defaultCooldown) {
  * Khi `call` thành công, cặp VẪN ĐANG được giữ chỗ: caller phải release() đúng 1 lần.
  * Khi `call` ném lỗi, withFallback tự release.
  */
-async function withFallback(agentRequest, { models, keys, stateStore, config }, call) {
+async function withFallback(agentRequest, { models, keys, stateStore, config }, call, options = {}) {
   const maxAttempts = (config && config.max_fallback_attempts) || 12;
   const defaultCooldown = (config && config.default_cooldown_seconds) || DEFAULT_COOLDOWN_SECONDS;
   const timeoutMs = (config && config.request_timeout_ms) || 60000;
@@ -71,8 +71,10 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
     if (found.length > 0) candidateModels = found;
   }
 
-  const estimated = estimateTokens(agentRequest && agentRequest.messages ? agentRequest.messages : agentRequest);
-  const geminiBody = openAiToGemini(agentRequest || {});
+  const estimated = options.geminiBody
+    ? estimateTokens(options.geminiBody)
+    : estimateTokens(agentRequest && agentRequest.messages ? agentRequest.messages : agentRequest);
+  const geminiBody = options.geminiBody || openAiToGemini(agentRequest || {});
 
   const maxTpm = Math.max(...candidateModels.map((m) => m.limits.tpm));
   if (estimated > maxTpm) {
@@ -169,4 +171,44 @@ async function openStream(agentRequest, deps) {
   return { upstream, pair, estimated, release };
 }
 
-module.exports = { handleRequest, openStream, Aggregated429Error };
+/**
+ * Non-stream native request (gemini-native endpoint).
+ * Gọi vớiFallback truyền { geminiBody } trực tiếp từ req.body.
+ * Trả kết quả geminiResponse, keyId, model name, attempts.
+ */
+async function handleNativeRequest(requestedModel, geminiBody, deps) {
+  const { geminiClient, stateStore } = deps;
+  const { value, pair, estimated, attempts } = await withFallback(
+    { model: requestedModel }, deps,
+    (p, ctx) => geminiClient.callGemini(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs }),
+    { geminiBody }
+  );
+  const total = (value.usageMetadata || {}).totalTokenCount || estimated;
+  stateStore.release(pair.key.id, pair.model.name, estimated);
+  stateStore.recordSuccess(pair.key.id, pair.model.name, total);
+  return { geminiResponse: value, usedKeyId: pair.key.id, usedModel: pair.model.name, attempts };
+}
+
+/**
+ * Stream native (gemini-native endpoint).
+ * Mở stream qua withFallback, trả { upstream, pair, estimated, release }.
+ * Caller (router) phải gọi release() mọi nhánh kết thúc.
+ * @returns {Promise<{ upstream, pair, estimated, release: () => void }>}
+ */
+async function openNativeStream(requestedModel, geminiBody, deps) {
+  const { geminiClient, stateStore } = deps;
+  const { value: upstream, pair, estimated } = await withFallback(
+    { model: requestedModel }, deps,
+    (p, ctx) => geminiClient.callGeminiStream(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs }),
+    { geminiBody }
+  );
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    stateStore.release(pair.key.id, pair.model.name, estimated);
+  };
+  return { upstream, pair, estimated, release };
+}
+
+module.exports = { handleRequest, openStream, handleNativeRequest, openNativeStream, Aggregated429Error };

@@ -14,6 +14,7 @@ Tự xoay tua cặp `(API key, model)` khi gặp 429, agent không cần biết.
 ```bash
 cp config/keys.example.json config/keys.json   # Windows PowerShell: Copy-Item config/keys.example.json config/keys.json
 ```
+
 2. Cài đặt & chạy:
 
 ```bash
@@ -32,9 +33,18 @@ npm start
 | Method | Path | Mô tả |
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI-compatible chat (hỗ trợ `stream: true` SSE, tool/function-calling: `tools`, `tool_choice`, `tool_calls`) |
+| POST | `/v1beta/models/:modelAction` | **Gemini-native**: truyền body thô lên Gemini, chọn cặp `(key, model)`, fallback 429/5xx. `:modelAction` là `modelName:action` (ví dụ `gemini-2.5-flash:generateContent`). Hỗ trợ `generateContent` và `streamGenerateContent`. |
 | GET | `/v1/models` | Danh sách model đang cấu hình |
 | GET | `/admin/status` | Debug: quota đã dùng / còn lại từng cặp (key, model) |
 | GET | `/health` | Health check |
+
+### Gemini-native
+
+- Không dịch format request/response (truyền body thô, trả response gốc Gemini).
+- Forward byte SSE gốc, **không ghi `[DONE]`**.
+- Chỉ hỗ trợ `generateContent` và `streamGenerateContent`.
+- `respect_agent_model: true` để dùng model trên URL; mặc định `false` (proxy tự xoay model).
+- Auth: bỏ qua `x-goog-api-key` và `?key=` từ client, chỉ dùng key thật từ config.
 
 ## Cấu hình
 
