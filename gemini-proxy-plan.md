@@ -114,20 +114,31 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
   giá trị `example`/`default`/`enum` giữ nguyên. **Lý do:** test live với OpenCode
   bị Gemini 400 `Unknown name "additionalProperties" at 'tools[0]...parameters'`
   (agent gửi JSON Schema draft-07 đầy đủ, Gemini chỉ nhận subset OpenAPI 3.0).
-- **thoughtSignature (Gemini 3):** `thoughtSignature` là field của **Part** (sibling
-  của `functionCall`, xác nhận từ response thật — cùng 1 chunk streaming). Gemini 3
-  **bắt buộc** gửi lại signature này khi replay history functionCall, thiếu là 400
-  `Function call is missing a thought_signature in functionCall parts`.
-  OpenAI format không có chỗ chứa nó và client không echo field lạ → **nhúng vào
-  `tool_call_id`** dạng `callsig_<encName>_<rand>_<sig>` (`encName` không còn `_`
-  để parse chắc chắn; sig ở đuôi nên chứa gì cũng không phá parse). Khi build
+- **thoughtSignature (Gemini 3):** `thoughtSignature` là field của **Part** — xác nhận
+  từ response thật — **không phải lúc nào cũng cùng part với `functionCall`**: có thể
+  nằm ở part RIÊNG trong cùng response, hoặc đến Ở CHUNK SAU trong streaming (test live
+  thấy 1/22 call bị lỡ → id cũ không sig → replay 400 `Function call is missing a
+  thought_signature`). Gemini 3 **bắt buộc** gửi lại signature này khi replay history
+  functionCall. OpenAI format không có chỗ chứa nó và client không echo field lạ →
+  **nhúng vào `tool_call_id`** dạng `callsig_<encName>_<rand>_<sig>` (`encName` không
+  còn `_` để parse chắc chắn; sig ở đuôi nên chứa gì cũng không phá parse). Khi build
   history, decode từ id và gắn lại thành field sibling của `functionCall` part.
-  Id không mang signature (model 2.5 / client tự tạo id) → format cũ `call_<name>_<rand>`,
-  parse/FIFO không đổi. Nhúng vào id thay vì cache trong proxy vì id được client echo
-  nguyên vẹn → sống sót qua restart, không cần state. **Lưu ý:** phiên hội thoại tạo
-  TRƯỚC khi có fix thì signature đã mất vĩnh viễn (không khôi phục được) — phải mở
-  session mới; text part signature (final part) không truyền được qua OpenAI format
-  (chỉ ảnh hưởng chất lượng, không 400).
+  **Bắt sig không phụ thuộc vị trí:**
+  - Non-stream / cùng chunk: `extractToolCalls` gom pool sig từ các part chỉ có
+    `thoughtSignature` (không kèm `functionCall`) rồi gán vào call thiếu sig theo thứ tự.
+  - Streaming cross-chunk: `server.js` **defer chunk** — chunk chứa `tool_calls` chưa
+    có sig được giữ lại (không ghi byte ra client), sig từ chunk sau được gán vào bằng
+    `attachThoughtSignature(id, sig)` rồi xả cả hàng đợi theo đúng thứ tự; trễ nhất
+    xả ở cuối stream TRƯỚC `[DONE]`. Kèm WARN khi sig không bao giờ đến (Gemini thực
+    sự không trả sig) để chẩn đoán. Heuristic: sig cùng chunk ưu tiên gán cho call cùng
+    chunk trước (thứ tự lồng nhau hiếm khi sai).
+  Id không mang signature (model 2.5 / client tự tạo id / sig không đến) → format cũ
+  `call_<name>_<rand>`, parse/FIFO không đổi. Nhúng vào id thay vì cache trong proxy vì
+  id được client echo nguyên vẹn → sống sót qua restart, không cần state (đã xác minh
+  OpenCode lưu/echo nguyên id `callsig_...`). **Lưu ý:** phiên hội thoại có call bị lỡ
+  sig (tạo trước khi có fix này) thì signature đã mất vĩnh viễn (không khôi phục được)
+  — phải mở session mới; text part signature (final part) không truyền được qua OpenAI
+  format (chỉ ảnh hưởng chất lượng, không 400).
 - **Assistant response:** `tool_calls` → `functionCall` parts.
 - **Tool result:** `role: "tool"` → `functionResponse` parts. `extractToolName` ưu tiên parse tên
   từ `tool_call_id` (id do `makeToolCallId` tạo, nhúng tên function đã encode); fallback FIFO

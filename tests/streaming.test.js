@@ -74,6 +74,49 @@ describe('streaming route (ReadableStream body)', () => {
     }
   });
 
+  it('holds tool_call chunk until thoughtSignature arrives in a LATER chunk', async () => {
+    const store = new StateStore(null);
+    const models = [{ name: 'm', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1000000 } }];
+    const keys = [{ id: 'key-1', api_key: 'k1', enabled: true }];
+    const SIG = 'late-sig+99/==';
+
+    // 3 payload: functionCall (không sig) -> orphan thoughtSignature -> finish
+    const p1 = 'data: ' + JSON.stringify({
+      candidates: [{ content: { parts: [{ functionCall: { name: 'read', args: { path: 'a' } } }] }, finishReason: 'STOP' }],
+    }) + '\n\n';
+    const p2 = 'data: ' + JSON.stringify({
+      candidates: [{ content: { parts: [{ thoughtSignature: SIG }] } }],
+    }) + '\n\n';
+    const p3 = 'data: ' + JSON.stringify({
+      candidates: [{ content: { parts: [] } }, { content: { parts: [] } }],
+    }) + '\n\n';
+
+    const fakeClient = {
+      callGeminiStream: async () => ({ body: makeReadableStream([p1, p2, p3]) }),
+    };
+
+    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const server = app.listen(0);
+    await new Promise((r) => server.once('listening', r));
+    const port = server.address().port;
+
+    try {
+      const res = await post(port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      const tcLine = res.body.split('\n').find((l) => l.includes('tool_calls'));
+      assert.ok(tcLine, 'phải có chunk tool_calls');
+      const tc = JSON.parse(tcLine.slice(5)).choices[0].delta.tool_calls[0];
+      assert.ok(tc.id.startsWith('callsig_'), 'sig đến chunk sau vẫn phải gán vào id');
+      assert.ok(tc.id.endsWith(`_${SIG}`));
+      // thứ tự: tool_calls TRƯỚC [DONE]
+      assert.ok(res.body.indexOf('tool_calls') < res.body.indexOf('[DONE]'));
+      assert.ok(res.body.includes('[DONE]'));
+      assert.equal(store.get('key-1', 'm').daily_count, 1, 'stream hoàn tất -> recordSuccess');
+    } finally {
+      server.close();
+    }
+  });
+
   it('does NOT write [DONE] or recordSuccess when stream is interrupted', async () => {
     const store = new StateStore(null);
     const models = [{ name: 'm', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1000000 } }];

@@ -251,10 +251,10 @@ function makeToolCallId(name, thoughtSignature) {
 }
 
 /**
- * Parse tool_call_id -> { name?, thoughtSignature? }.
+ * Parse tool_call_id -> { name?, thoughtSignature?, rand? }.
  * - Format mới `callsig_<encName>_<rand>_<sig>`: encName không chứa '_', nên tách từ trái là chắc chắn;
  *   sig là đuôi nên chứa ký tự gì (kể cả '_') cũng không phá parse.
- * - Format cũ `call_<encName>_<rand>` (id client tự tạo / không có signature): chỉ có name.
+ * - Format cũ `call_<encName>_<rand>` (id client tự tạo / không có signature): name + rand (không sig).
  * - Không nhận diện được -> {} (caller rơi về FIFO như cũ).
  */
 function parseToolCallId(toolCallId) {
@@ -263,13 +263,13 @@ function parseToolCallId(toolCallId) {
   if (n) {
     let name;
     try { name = decodeURIComponent(n[1]); } catch (_) { name = n[1]; }
-    return { name, thoughtSignature: n[3] };
+    return { name, thoughtSignature: n[3], rand: n[2] };
   }
   const m = /^call_(.+)_([a-z0-9]{2,16})$/.exec(toolCallId);
   if (m) {
     let name;
     try { name = decodeURIComponent(m[1]); } catch (_) { name = m[1]; }
-    return { name };
+    return { name, rand: m[2] };
   }
   return {};
 }
@@ -284,14 +284,34 @@ function thoughtSignatureFromToolCallId(toolCallId) {
   return parseToolCallId(toolCallId).thoughtSignature;
 }
 
-/** Chuyển Gemini functionCall sang OpenAI tool_calls */
+/**
+ * Gắn thoughtSignature vào tool_call_id ĐÃ phát ra (format cũ, không sig) — dùng khi
+ * signature đến muộn ở chunk/part sau trong streaming. Trả id gốc nếu không gắn được
+ * (id không parse được / đã có sig).
+ */
+function attachThoughtSignature(toolCallId, thoughtSignature) {
+  if (!thoughtSignature || typeof toolCallId !== 'string') return toolCallId;
+  const p = parseToolCallId(toolCallId);
+  if (!p.name || p.thoughtSignature || !p.rand) return toolCallId;
+  const encName = encodeURIComponent(p.name).replace(/_/g, '%5F');
+  return `callsig_${encName}_${p.rand}_${thoughtSignature}`;
+}
+
+/**
+ * Chuyển Gemini functionCall sang OpenAI tool_calls.
+ * thoughtSignature có thể nằm CÙNG part (sibling) hoặc ở part RIÊNG (không kèm functionCall)
+ * trong CÙNG response/chunk — gom pool rồi gán vào call thiếu sig theo thứ tự.
+ */
 function extractToolCalls(parts) {
+  const sigPool = parts
+    .filter((p) => p.thoughtSignature && !p.functionCall)
+    .map((p) => p.thoughtSignature);
   const toolCalls = [];
   for (const p of parts) {
     if (p.functionCall) {
+      const thoughtSignature = p.thoughtSignature || sigPool.shift();
       toolCalls.push({
-        // thoughtSignature là field của Part (sibling của functionCall) — nhúng vào id
-        id: makeToolCallId(p.functionCall.name, p.thoughtSignature),
+        id: makeToolCallId(p.functionCall.name, thoughtSignature),
         type: 'function',
         function: {
           name: p.functionCall.name,
@@ -365,4 +385,4 @@ function geminiChunkToOpenAiChunk(geminiChunk, modelName, streamId, created, too
   };
 }
 
-module.exports = { openAiToGemini, geminiToOpenAi, geminiChunkToOpenAiChunk };
+module.exports = { openAiToGemini, geminiToOpenAi, geminiChunkToOpenAiChunk, attachThoughtSignature };

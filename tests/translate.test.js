@@ -1,6 +1,6 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { openAiToGemini, geminiToOpenAi, geminiChunkToOpenAiChunk } = require('../api/translate');
+const { openAiToGemini, geminiToOpenAi, geminiChunkToOpenAiChunk, attachThoughtSignature } = require('../api/translate');
 const { estimateTokens } = require('../utils/tokenEstimate');
 const { nextMidnightPacific } = require('../utils/time');
 
@@ -233,6 +233,33 @@ describe('translate', () => {
       candidates: [{ content: { parts: [{ functionCall: { name: 'f', args: {} } }] }, finishReason: 'STOP' }],
     }, 'gemini-2.5-flash', 'chatcmpl-x', 1, 0);
     assert.ok(noSig.choices[0].delta.tool_calls[0].id.startsWith('call_'));
+  });
+
+  it('gom thoughtSignature từ part RIÊNG (không cùng part với functionCall)', () => {
+    const SIG = 'orphan-sig+xyz/==';
+    // Response thật: Gemini đôi khi để thoughtSignature ở part riêng, KHÔNG kèm functionCall
+    const oai = geminiToOpenAi({
+      candidates: [{
+        content: { parts: [
+          { functionCall: { name: 'read', args: { path: 'x.js' } } },
+          { thoughtSignature: SIG },
+        ] },
+        finishReason: 'STOP',
+      }],
+    }, 'gemini-3.8-flash');
+    const tc = oai.choices[0].message.tool_calls[0];
+    assert.ok(tc.id.startsWith('callsig_'), 'phải gán sig từ orphan part');
+    assert.ok(tc.id.endsWith(`_${SIG}`));
+
+    // gán sig muộn cho id đã phát ra ở format cũ (dùng cho streaming cross-chunk)
+    const late = attachThoughtSignature('call_read_71snibw6', SIG);
+    assert.ok(late.startsWith('callsig_read_71snibw6_'));
+    assert.ok(late.endsWith(`_${SIG}`));
+    // id không parse được -> giữ nguyên, không phá id
+    assert.equal(attachThoughtSignature('call_1', SIG), 'call_1');
+    // đã có sig -> không gán đè
+    const withSig = 'callsig_read_abc12345_old';
+    assert.equal(attachThoughtSignature(withSig, SIG), withSig);
   });
 
   it('adds required index to streaming tool_calls deltas (cumulative across chunks)', () => {
