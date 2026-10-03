@@ -298,18 +298,33 @@ function attachThoughtSignature(toolCallId, thoughtSignature) {
 }
 
 /**
+ * Chuẩn hóa thoughtSignature từ Part: API trả string, nhưng phòng shape
+ * object ({signature: ...}) -> lấy field string bên trong; không được -> null.
+ */
+function normalizeThoughtSignature(v) {
+  if (typeof v === 'string') return v;
+  if (v && typeof v === 'object') {
+    for (const k of ['signature', 'value', 'sig', 'thoughtSignature']) {
+      if (typeof v[k] === 'string') return v[k];
+    }
+  }
+  return null;
+}
+
+/**
  * Chuyển Gemini functionCall sang OpenAI tool_calls.
  * thoughtSignature có thể nằm CÙNG part (sibling) hoặc ở part RIÊNG (không kèm functionCall)
  * trong CÙNG response/chunk — gom pool rồi gán vào call thiếu sig theo thứ tự.
  */
 function extractToolCalls(parts) {
   const sigPool = parts
-    .filter((p) => p.thoughtSignature && !p.functionCall)
-    .map((p) => p.thoughtSignature);
+    .filter((p) => p.thoughtSignature !== undefined && !p.functionCall)
+    .map((p) => normalizeThoughtSignature(p.thoughtSignature))
+    .filter((s) => s !== null);
   const toolCalls = [];
   for (const p of parts) {
     if (p.functionCall) {
-      const thoughtSignature = p.thoughtSignature || sigPool.shift();
+      const thoughtSignature = normalizeThoughtSignature(p.thoughtSignature) || sigPool.shift();
       toolCalls.push({
         id: makeToolCallId(p.functionCall.name, thoughtSignature),
         type: 'function',

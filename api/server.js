@@ -86,8 +86,15 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         const result = await handleRequest(agentRequest, deps);
         // tool_call không có thoughtSignature -> id ở format cũ, replay history Gemini 3 sẽ 400
         const tcs = result.openAiResponse?.choices?.[0]?.message?.tool_calls;
-        if (Array.isArray(tcs) && tcs.some((t) => !String(t.id || '').startsWith('callsig_'))) {
-          logger.warn(`Response có tool_call KHÔNG kèm thoughtSignature (model=${result.usedModel}) — Gemini không trả sig, replay history có thể 400`);
+        if (Array.isArray(tcs)) {
+          const bad = tcs.filter((t) => !String(t.id || '').startsWith('callsig_'));
+          if (bad.length > 0) {
+            logger.warn(`Response có ${bad.length} tool_call KHÔNG kèm thoughtSignature — replay history sẽ 400 với Gemini 3`, {
+              ids: bad.map((t) => t.id),
+              model: result.usedModel,
+              key: result.usedKeyId,
+            });
+          }
         }
         return res.json(result.openAiResponse);
       } catch (e) {
@@ -128,19 +135,38 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     let clientAborted = false;
     let streamError = null;
 
-    // thoughtSignature đôi khi đến Ở CHUNK/PART SAU khi functionCall (test live: 1/22 call
-    // bị lỡ -> id cũ không sig -> replay 400). Trì hoãn ghi ra client: giữ chunk tới khi
-    // sig về gán vào, hoặc tới cuối stream nếu sig không bao giờ đến (plan §4.5).
+    // thoughtSignature đôi khi đến Ở CHUNK/PART SAU khi functionCall (test live:
+    // ~1/20 call bị lỡ -> id cũ không sig -> replay 400). Trì hoãn ghi ra client:
+    // giữ chunk tới khi sig về gán vào, hoặc tới cuối stream nếu sig không bao
+    // giờ đến (plan §4.5). Kèm diagnostic để điều tra khi sig "mất tích".
     const deferred = []; // chunk object đang giữ (giữ nguyên thứ tự)
     const pendingSigs = []; // orphan thoughtSignature chưa gán (đến trước/alongside call)
     const toolCallsOf = (out) => (out && out.choices && out.choices[0] && out.choices[0].delta && out.choices[0].delta.tool_calls) || [];
     const isSigless = (tc) => !String(tc.id || '').startsWith('callsig_');
     const anySigless = () => deferred.some((d) => toolCallsOf(d).some(isSigless));
     const writeChunk = (out) => res.write(`data: ${JSON.stringify(out)}\n\n`);
+    // Diagnostic: đếm + giữ raw payload (cắt ngắn) các chunk liên quan, chỉ dump
+    // khi cuối stream vẫn còn call thiếu sig -> WARN chi tiết để điều tra.
+    const diag = { events: 0, fcParts: 0, sigParts: 0, orphanSigs: 0, unparseable: 0, fcRaw: [], sigRaw: [] };
+    const rememberRaw = (arr, payload) => {
+      if (arr.length < 10) arr.push(payload.length > 1500 ? payload.slice(0, 1500) + '…(trunc)' : payload);
+    };
     const flushDeferred = () => {
       if (anySigless()) {
-        const n = deferred.reduce((s, d) => s + toolCallsOf(d).filter(isSigless).length, 0);
-        logger.warn(`Stream: ${n} tool_call phát ra KHÔNG có thoughtSignature (Gemini không trả sig) — replay history có thể 400 với Gemini 3`);
+        const ids = deferred.flatMap((d) => toolCallsOf(d)).filter(isSigless).map((tc) => tc.id);
+        logger.warn(`Stream: ${ids.length} tool_call phát ra KHÔNG có thoughtSignature — replay history sẽ 400 với Gemini 3`, {
+          ids,
+          model: pair.model.name,
+          key: pair.key.id,
+          events: diag.events,
+          fcParts: diag.fcParts,
+          sigParts: diag.sigParts,
+          orphanSigs: diag.orphanSigs,
+          unparseableEvents: diag.unparseable,
+          leftoverSigs: pendingSigs.length,
+          fcRaw: diag.fcRaw,
+          sigRaw: diag.sigRaw,
+        });
       }
       while (deferred.length) writeChunk(deferred.shift());
     };
@@ -163,35 +189,91 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       }
     });
 
-    const handleLine = (line) => {
-      const t = line.trim();
-      if (!t.startsWith('data:')) return;
-      const payload = t.slice(5).trim();
+    // Chuẩn hóa thoughtSignature: API trả string, nhưng phòng shape object
+    // ({signature: ...}) -> lấy field string bên trong; không nhận được -> null.
+    const normalizeSig = (v) => {
+      if (typeof v === 'string') return v;
+      if (v && typeof v === 'object') {
+        for (const k of ['signature', 'value', 'sig', 'thoughtSignature']) {
+          if (typeof v[k] === 'string') return v[k];
+        }
+      }
+      return null;
+    };
+
+    const processEvent = (payload) => {
       if (!payload || payload === '[DONE]') return;
+      let g;
       try {
-        const g = JSON.parse(payload);
-        if (g.usageMetadata && g.usageMetadata.totalTokenCount) totalTokens = g.usageMetadata.totalTokenCount;
-        const parts = (g.candidates && g.candidates[0] && g.candidates[0].content && g.candidates[0].content.parts) || [];
-        const orphanSigs = parts.filter((p) => p.thoughtSignature && !p.functionCall).map((p) => p.thoughtSignature);
-        const siglessCalls = parts.filter((p) => p.functionCall && !p.thoughtSignature).length;
-        const out = geminiChunkToOpenAiChunk(g, pair.model.name, streamId, created, toolCallIndex);
-        toolCallIndex += toolCallsOf(out).length;
-
-        // same-chunk pairing đã làm trong extractToolCalls (min(siglessCalls, orphanSigs)),
-        // phần orphan dư lại -> pending
-        for (let i = Math.min(siglessCalls, orphanSigs.length); i < orphanSigs.length; i++) {
-          pendingSigs.push(orphanSigs[i]);
+        g = JSON.parse(payload);
+      } catch (_) {
+        diag.unparseable++;
+        logger.warn(`Stream: chunk SSE không parse được (bỏ qua)`, { payload: payload.slice(0, 500) });
+        return;
+      }
+      diag.events++;
+      if (g.usageMetadata && g.usageMetadata.totalTokenCount) totalTokens = g.usageMetadata.totalTokenCount;
+      const parts = (g.candidates && g.candidates[0] && g.candidates[0].content && g.candidates[0].content.parts) || [];
+      const orphanSigs = [];
+      let siglessCalls = 0;
+      for (const p of parts) {
+        // phát hiện shape lạ: field chứa "thought"/"sign" mà không phải thoughtSignature
+        for (const k of Object.keys(p)) {
+          if (k !== 'thoughtSignature' && /thought|sign/i.test(k)) {
+            logger.warn(`Stream: part có field bất thường "${k}" (shape thoughtSignature có thể đổi)`, { keys: Object.keys(p) });
+          }
         }
-        attachPending(out);
-
-        const outSigless = toolCallsOf(out).some(isSigless);
-        if (outSigless || deferred.length > 0) {
-          deferred.push(out); // giữ thứ tự: không ghi chunk mới khi còn chunk cũ đang defer
-          if (!anySigless()) flushDeferred(); // sig vừa về đã gán hết -> xả ngay
-          return;
+        if (p.functionCall) {
+          diag.fcParts++;
+          if (p.thoughtSignature === undefined) {
+            siglessCalls++;
+            rememberRaw(diag.fcRaw, payload); // chunk chứa call chưa có sig — bằng chứng nếu sig không về
+          }
         }
-        writeChunk(out);
-      } catch (_) { /* bỏ qua chunk không parse được */ }
+        if (p.thoughtSignature !== undefined) {
+          diag.sigParts++;
+          const sig = normalizeSig(p.thoughtSignature);
+          if (!sig) {
+            logger.warn(`Stream: thoughtSignature không phải string (không gắn được)`, { value: JSON.stringify(p.thoughtSignature).slice(0, 500) });
+          } else if (!p.functionCall) {
+            diag.orphanSigs++;
+            orphanSigs.push(sig);
+            rememberRaw(diag.sigRaw, payload);
+          }
+        }
+      }
+      const out = geminiChunkToOpenAiChunk(g, pair.model.name, streamId, created, toolCallIndex);
+      toolCallIndex += toolCallsOf(out).length;
+
+      // same-chunk pairing đã làm trong extractToolCalls (min(siglessCalls, orphanSigs)),
+      // phần orphan dư lại -> pending
+      for (let i = Math.min(siglessCalls, orphanSigs.length); i < orphanSigs.length; i++) {
+        pendingSigs.push(orphanSigs[i]);
+      }
+      attachPending(out);
+
+      const outSigless = toolCallsOf(out).some(isSigless);
+      if (outSigless || deferred.length > 0) {
+        deferred.push(out); // giữ thứ tự: không ghi chunk mới khi còn chunk cũ đang defer
+        if (!anySigless()) flushDeferred(); // sig vừa về đã gán hết -> xả ngay
+        return;
+      }
+      writeChunk(out);
+    };
+
+    // SSE đúng spec: 1 event = nhiều dòng `data:` (gộp lại, phân tách '\n'),
+    // kết thúc bởi dòng trống. Các field khác (event:/id:/retry:) và comment (:) bỏ qua.
+    let dataLines = [];
+    const handleLine = (line) => {
+      const l = line.replace(/\r$/, '');
+      if (l === '') {
+        if (dataLines.length > 0) {
+          processEvent(dataLines.join('\n'));
+          dataLines = [];
+        }
+        return;
+      }
+      if (l.startsWith('data:')) dataLines.push(l.slice(5).replace(/^ /, ''));
     };
 
     let buffer = '';
@@ -206,6 +288,8 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         for (const line of lines) handleLine(line);
       }
       if (!clientAborted && buffer) handleLine(buffer); // dòng cuối không có '\n'
+      if (dataLines.length > 0) processEvent(dataLines.join('\n')); // event cuối thiếu dòng trống
+      dataLines = [];
       streamCompleted = !clientAborted;
     } catch (e) {
       streamError = e;

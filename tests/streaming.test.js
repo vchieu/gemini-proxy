@@ -117,6 +117,38 @@ describe('streaming route (ReadableStream body)', () => {
     }
   });
 
+  it('joins multi-line data: fields per SSE spec (event ends at blank line)', async () => {
+    const store = new StateStore(null);
+    const models = [{ name: 'm', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1000000 } }];
+    const keys = [{ id: 'key-1', api_key: 'k1', enabled: true }];
+
+    // payload JSON bị tách thành 2 dòng data: (SSE spec: gộp với '\n')
+    const payload = JSON.stringify({
+      candidates: [{ content: { parts: [{ text: 'multiline-ok' }] }, finishReason: 'STOP' }],
+    });
+    const half = Math.floor(payload.length / 2);
+    const sse = `data: ${payload.slice(0, half)}\ndata: ${payload.slice(half)}\n\n`;
+
+    const fakeClient = {
+      callGeminiStream: async () => ({ body: makeReadableStream([sse]) }),
+    };
+
+    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const server = app.listen(0);
+    await new Promise((r) => server.once('listening', r));
+    const port = server.address().port;
+
+    try {
+      const res = await post(port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      assert.ok(res.body.includes('multiline-ok'), 'phải gộp multi-line data: rồi parse được');
+      assert.ok(res.body.includes('[DONE]'));
+      assert.equal(store.get('key-1', 'm').daily_count, 1, 'stream hoàn tất -> recordSuccess');
+    } finally {
+      server.close();
+    }
+  });
+
   it('does NOT write [DONE] or recordSuccess when stream is interrupted', async () => {
     const store = new StateStore(null);
     const models = [{ name: 'm', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1000000 } }];

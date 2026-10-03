@@ -129,9 +129,17 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
   - Streaming cross-chunk: `server.js` **defer chunk** — chunk chứa `tool_calls` chưa
     có sig được giữ lại (không ghi byte ra client), sig từ chunk sau được gán vào bằng
     `attachThoughtSignature(id, sig)` rồi xả cả hàng đợi theo đúng thứ tự; trễ nhất
-    xả ở cuối stream TRƯỚC `[DONE]`. Kèm WARN khi sig không bao giờ đến (Gemini thực
-    sự không trả sig) để chẩn đoán. Heuristic: sig cùng chunk ưu tiên gán cho call cùng
-    chunk trước (thứ tự lồng nhau hiếm khi sai).
+    xả ở cuối stream TRƯỚC `[DONE]`. **SSE parsing đúng spec**: 1 event = nhiều dòng
+    `data:` (gộp với `\n`), kết thúc tại dòng trống — chunk chứa sig bị tách dòng
+    sẽ không bị bỏ sót thầm lặng.
+  - **Diagnostic (điều tra khi sig "mất tích"):** cuối stream vẫn còn call thiếu
+    sig → WARN kèm counters (events/fcParts/sigParts/orphanSigs/unparseableEvents/
+    leftoverSigs) + **dump raw payload** (cắt ngắn 1500 ký tự, tối đa 10 chunk) của
+    các chunk chứa functionCall chưa có sig và chunk chứa sig; WARN ngay khi gặp
+    field chứa `thought`/`sign` bất thường, `thoughtSignature` không phải string,
+    hoặc chunk SSE không parse được. Non-stream path cũng WARN kèm ids/model/key.
+    Heuristic: sig cùng chunk ưu tiên gán cho call cùng chunk trước (thứ tự lồng
+    nhau hiếm khi sai).
   Id không mang signature (model 2.5 / client tự tạo id / sig không đến) → format cũ
   `call_<name>_<rand>`, parse/FIFO không đổi. Nhúng vào id thay vì cache trong proxy vì
   id được client echo nguyên vẹn → sống sót qua restart, không cần state (đã xác minh
