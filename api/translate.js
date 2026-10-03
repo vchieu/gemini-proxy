@@ -301,6 +301,29 @@ function attachThoughtSignature(toolCallId, thoughtSignature) {
  * Chuẩn hóa thoughtSignature từ Part: API trả string, nhưng phòng shape
  * object ({signature: ...}) -> lấy field string bên trong; không được -> null.
  */
+
+/**
+ * Trích xuất thoughtSignature từ part - cố gắng nhiều format, * ưu tiên p.thoughtSignature trực tiếp (có thể là string hoặc object). */
+function extractThoughtSignatureFromPart(p) {
+  // 1. String trực tiếp
+  if (typeof p.thoughtSignature === "string" && p.thoughtSignature.length > 0) {
+    return { success: true, sig: p.thoughtSignature };
+  }
+  // 2. Object: thử các field phổ biến
+  if (p.thoughtSignature && typeof p.thoughtSignature === "object") {
+    for (const k of ["signature", "value", "sig", "thoughtSignature"]) {
+      if (typeof p.thoughtSignature[k] === "string" && p.thoughtSignature[k].length > 0) {
+        return { success: true, sig: p.thoughtSignature[k] };
+      }
+    }
+    // 3. Object lồng
+    const obj = p.thoughtSignature;
+    if (typeof obj.signature === "string") return { success: true, sig: obj.signature };
+    if (typeof obj.value === "string") return { success: true, sig: obj.value };
+    if (typeof obj.sig === "string") return { success: true, sig: obj.sig };
+  }
+  return { success: false };
+}
 function normalizeThoughtSignature(v) {
   if (typeof v === 'string') return v;
   if (v && typeof v === 'object') {
@@ -316,6 +339,37 @@ function normalizeThoughtSignature(v) {
  * thoughtSignature có thể nằm CÙNG part (sibling) hoặc ở part RIÊNG (không kèm functionCall)
  * trong CÙNG response/chunk — gom pool rồi gán vào call thiếu sig theo thứ tự.
  */
+function extractToolCalls(parts) {
+  // Pool sig từ các part chỉ có thoughtSignature (không kèm functionCall),
+  // dùng cho khi functionCall không có sig trong cùng part.
+  const sigPool = parts
+    .filter((p) => p.thoughtSignature !== undefined && !p.functionCall)
+    .map((p) => normalizeThoughtSignature(p.thoughtSignature))
+    .filter((s) => s !== null);
+  const toolCalls = [];
+  for (const p of parts) {
+    if (p.functionCall) {
+      // 1. Thử trích xuất thoughtSignature trực tiếp từ cùng part
+      const direct = extractThoughtSignatureFromPart(p);
+      let thoughtSignature;
+      if (direct.success) {
+        thoughtSignature = direct.sig;
+      } else {
+        // 2. Thử pool sig từ các part orphan (không kèm functionCall)
+        thoughtSignature = sigPool.shift();
+      }
+      toolCalls.push({
+        id: makeToolCallId(p.functionCall.name, thoughtSignature),
+        type: 'function',
+        function: {
+          name: p.functionCall.name,
+          arguments: JSON.stringify(p.functionCall.args || {}),
+        },
+      });
+    }
+  }
+  return toolCalls.length > 0 ? toolCalls : undefined;
+}
 function extractToolCalls(parts) {
   const sigPool = parts
     .filter((p) => p.thoughtSignature !== undefined && !p.functionCall)
