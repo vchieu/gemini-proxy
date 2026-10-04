@@ -34,6 +34,7 @@ npm start
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI-compatible chat (hỗ trợ `stream: true` SSE, tool/function-calling: `tools`, `tool_choice`, `tool_calls`) |
 | POST | `/v1beta/models/:modelAction` | **Gemini-native**: truyền body thô lên Gemini, chọn cặp `(key, model)`, fallback 429/5xx. `:modelAction` là `modelName:action` (ví dụ `gemini-2.5-flash:generateContent`). Hỗ trợ `generateContent` và `streamGenerateContent`. |
+| GET | `/v1beta/models` | Danh sách model dạng Google (`name`, `displayName`, `supportedGenerationMethods`) |
 | GET | `/v1/models` | Danh sách model đang cấu hình |
 | GET | `/admin/status` | Debug: quota đã dùng / còn lại từng cặp (key, model) |
 | GET | `/health` | Health check |
