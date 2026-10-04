@@ -1,3 +1,5 @@
+const { makeToolCallId, parseToolCallId } = require('../utils/toolCallId');
+
 function normalizeContent(content) {
   if (content == null) return [{ text: '' }];
   if (typeof content === 'string') return [{ text: content }];
@@ -256,49 +258,6 @@ function mapFinishReason(fr) {
   }
 }
 
-/**
- * Tạo tool_call_id — nhúng tên function (encoded) để map lại đúng khi client trả
- * tool result, kể cả parallel/out-of-order.
- *
- * Nếu có `thoughtSignature` (Gemini 3 bắt buộc replay khi gửi lại history functionCall
- * — xem plan §4.5) thì nhúng luôn vào id dạng `callsig_<name>_<rand>_<sig>`:
- * OpenAI format không có chỗ chứa signature và client không echo field lạ, nên id là
- * kênh duy nhất sống sót qua cả restart proxy (không cần state).
- */
-function makeToolCallId(name, thoughtSignature) {
-  const rand = Math.random().toString(36).slice(2, 10);
-  if (typeof thoughtSignature === 'string' && thoughtSignature.length > 0 && thoughtSignature.length <= 8192) {
-    // encodedName không còn '_' (đổi thành %5F) để parse không bị nhầm với rand/sig
-    const encName = encodeURIComponent(name).replace(/_/g, '%5F');
-    return `callsig_${encName}_${rand}_${thoughtSignature}`;
-  }
-  return `call_${encodeURIComponent(name)}_${rand}`;
-}
-
-/**
- * Parse tool_call_id -> { name?, thoughtSignature?, rand? }.
- * - Format mới `callsig_<encName>_<rand>_<sig>`: encName không chứa '_', nên tách từ trái là chắc chắn;
- *   sig là đuôi nên chứa ký tự gì (kể cả '_') cũng không phá parse.
- * - Format cũ `call_<encName>_<rand>` (id client tự tạo / không có signature): name + rand (không sig).
- * - Không nhận diện được -> {} (caller rơi về FIFO như cũ).
- */
-function parseToolCallId(toolCallId) {
-  if (typeof toolCallId !== 'string') return {};
-  const n = /^callsig_([^_]+)_([a-z0-9]{1,16})_(.+)$/.exec(toolCallId);
-  if (n) {
-    let name;
-    try { name = decodeURIComponent(n[1]); } catch (_) { name = n[1]; }
-    return { name, thoughtSignature: n[3], rand: n[2] };
-  }
-  const m = /^call_(.+)_([a-z0-9]{2,16})$/.exec(toolCallId);
-  if (m) {
-    let name;
-    try { name = decodeURIComponent(m[1]); } catch (_) { name = m[1]; }
-    return { name, rand: m[2] };
-  }
-  return {};
-}
-
 /** Đọc tên function từ tool_call_id; trả undefined với id không nhúng tên (call_1, hash...) */
 function nameFromToolCallId(toolCallId) {
   return parseToolCallId(toolCallId).name;
@@ -463,8 +422,9 @@ module.exports = {
   geminiToOpenAi,
   geminiChunkToOpenAiChunk,
   attachThoughtSignature,
-  // Dùng chung format id `callsig_<name>_<rand>_<sig>` với api/signatureShim.js
-  // (upstream_mode=openai_compat) — chỉ có 1 nơi định nghĩa format này.
+  // Định nghĩa gốc của format id `callsig_<name>_<rand>_<sig>` nằm ở
+  // `utils/toolCallId.js` (dùng chung với api/signatureShim.js) — re-export ở đây
+  // để giữ nguyên contract cũ của module.
   makeToolCallId,
   parseToolCallId,
 };

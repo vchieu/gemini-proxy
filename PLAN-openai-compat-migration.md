@@ -286,12 +286,14 @@ Chạy full test.
 
 ## Phase 5 — Tổng kiểm unit trước khi live
 
-- Chạy `node --test tests/*.test.js`: **118/118 xanh, 20 suite** (2026-10-04) — gồm 70 test cũ
+- Chạy `node --test tests/*.test.js`: **124/124 xanh, 20 suite** (2026-10-04) — gồm 70 test cũ
   (không test nào bị xoá/làm yếu) + **36 test mới**: `tests/configLoader.test.js` (5),
   `tests/openaiClient.test.js` (9), `tests/openaiFallback.test.js` (11),
   `tests/openaiStreaming.test.js` (11) + **12 test `tests/signatureShim.test.js`** (thêm sau khi
-  xác định Case B trong Phase 6).
-- Số test thực tế: **118** (đã ghi vào `README.md` §Test, `AGENTS.md` §4, `gemini-proxy-plan.md` §8).
+  xác định Case B trong Phase 6) + **6 test bổ sung sau review code** (fallback `estimated`
+  khi thiếu `usage`, wiring shim qua `handleRequest`, điền `index`, phát hiện `late`,
+  Case B stream).
+- Số test thực tế: **124** (đã ghi vào `README.md` §Test, `AGENTS.md` §4, `gemini-proxy-plan.md` §8).
 - Soát nhanh bằng mắt: không có `console.log(api_key)`; không `require` vòng (`api/openaiPassthrough.js` không require `api/server.js`; `api/signatureShim.js` chỉ require `./translate`).
 
 ---
@@ -356,11 +358,29 @@ Cập nhật **tất cả** mục dưới, nếu không thì phải nêu lý do 
 - `.gitignore`: không cần đổi (không tạo file chứa secret). Kiểm tra bạn **không** commit log/PID/file tạm.
 
 Checklist tự kiểm (đánh dấu từng dòng trong báo cáo):
-- [x] README mô tả đúng endpoint/config/cách chạy — §Cấu hình (`upstream_mode` mặc định `openai_compat` + env `UPSTREAM_MODE`), §Endpoint (`/v1/chat/completions`, `/admin/status`), §Các mode (`### openai_compat` / `### Legacy`), §Test (118), §Tài liệu khác
-- [x] Bảng contract AGENTS §3 khớp signature thực tế — Config Loader / Fallback / Gemini Client / OpenAI Passthrough / **OpenAI Signature Shim (dòng mới)** / API Layer / Translate
-- [x] Con số test kỳ vọng đúng — **118/118, 20 suite**
+- [x] README mô tả đúng endpoint/config/cách chạy — §Cấu hình (`upstream_mode` mặc định `openai_compat` + env `UPSTREAM_MODE`), §Endpoint (`/v1/chat/completions`, `/admin/status`), §Các mode (`### openai_compat` / `### Legacy`), §Test (124), §Tài liệu khác
+- [x] Bảng contract AGENTS §3 khớp signature thực tế — Config Loader / Fallback / Gemini Client / OpenAI Passthrough / **OpenAI Signature Shim (dòng mới)** / **Tool Call Id — `utils/toolCallId.js` (dòng mới)** / API Layer / Translate
+- [x] Con số test kỳ vọng đúng — **124/124, 20 suite**
 - [x] Lệch spec đã ghi lý do — `gemini-proxy-plan.md` §2/§3/§4.5/§6/§8 + `AGENTS.md` §2/§3/§4/§6.7 + `docs/openai-compat-spike.md`
 - [x] Đã chạy full test suite, kết quả có trong báo cáo
+
+### Phase 7.5 — Sửa sau khi review code (đọc diff, chưa chạy live)
+
+Review đọc 2 diff (`b4117d4`, `bc4ecf0`) và chỉ ra 1 lỗi thật + 3 rủi ro + 3 mục dọn dẹp.
+Đã xử lý:
+
+| # | Vấn đề | Xử lý |
+|---|---|---|
+| 1 | **Lỗi thật:** `handleRequest` nhánh `openai_compat` thiếu `\|\| estimated` khi Google không trả `usage` → `recordSuccess` ghi 0 token, TPM đếm thiếu | ✅ Thêm fallback + test `response WITHOUT usage -> records the token ESTIMATE` |
+| 2 | **Rủi ro:** stream `tool_calls` của Google không có `index` (L6 `sawIndex=false`) — client OpenAI nghiêm ngặt từng làm hỏng nhánh `translate` vì thiếu field này | ✅ `chunkToClient` điền `index` khi thiếu (không ghi đè nếu upstream đã gửi), giữ index ổn định qua `indexById`/`nextIndex`/`lastIndex`; test Case B stream + test riêng |
+| 3 | **Rủi ro:** `unshimmed` không phát hiện được case signature đến **sau** khi id đã gửi (L6 chỉ pass vì sig đi cùng delta với id) | ✅ Thêm cờ `late` + WARN ở `openaiPassthrough`; test `late` true/false |
+| 4 | **Rủi ro:** kết luận Q6 ("không field nào bị từ chối") dựa trên test hẹp | ✅ Bắt đầu soften trong `docs/openai-compat-spike.md` (xem dưới) — vẫn giữ `OPENAI_DROP_FIELDS` rỗng nhưng ghi rõ giới hạn của mẫu test |
+| 5 | **Dọn dẹp:** `makeToolCallId`/`parseToolCallId` cần sống độc lập với `api/translate.js` (để sau này xoá được `translate.js`) | ✅ Tạo **`utils/toolCallId.js`**; `api/translate.js` re-export (giữ contract cũ), `api/signatureShim.js` require thẳng từ `utils/` |
+| 6 | **Dọn dẹp:** `buildOpenAiUrl(key, stream)` nhận tham số không dùng | ✅ Bỏ hàm, dùng hằng `OPENAI_COMPAT_URL` |
+| 7 | **Dọn dẹp:** ~50 dòng `callGeminiStream`/`callOpenAIStream` bị copy-paste | ✅ Tách helper dùng chung `fetchSse(doFetch, timeoutMs)` |
+| 8 | **Dọn dẹp:** chính tả (`định义` ở `gemini-proxy-plan.md` §4.5, `Ng ngân sách` ở `scripts/live-test.js`, `client ngát` ở `openaiPassthrough.js`) | ✅ Đã sửa cả 3 |
+
+Số test sau khi sửa: **124/124, 20 suite**.
 
 ### Kết quả Phase 6 (live test)
 
@@ -381,10 +401,9 @@ Bảng chi tiết: **`docs/openai-compat-spike.md`** (L0–L11 + kết quả ch�
 |---|---|---|
 | 0 (spike) | ⚠️ **Lệch plan** | Không có `GEMINI_SPIKE_KEY` → **không tạo** `scripts/spike-openai-compat.js`. Thay vào đó, **Q1–Q7 được trả lời trực tiếp từ Phase 6 live test** và ghi vào `docs/openai-compat-spike.md`. Hệ quả: `OPENAI_DROP_FIELDS` giữ **rỗng** (Q6 không phát hiện field bị từ chối), schema không cần sanitize (Q4). |
 | 1–4 | ✅ Xong | Code + 36 unit test. |
-| 5 | ✅ Xong | **118/118 pass**, 20 suite (kèm 12 test shim thêm sau Phase 6). |
+| 5 | ✅ Xong | **124/124 pass**, 20 suite (12 test shim thêm sau Phase 6 + 6 test bổ sung sau review). |
 | 6 (live) | ✅ Xong | L0–L11 PASS; xác định **Case B** → tạo `api/signatureShim.js` (12 test unit mới) + export `makeToolCallId`/`parseToolCallId` từ `api/translate.js`; 6.4 flip default `openai_compat` + xác nhận bằng L0–L4 không env. Ngân sách 28 request (đã có phê duyệt vượt §2.3 cho attempt). |
 | 7 (docs) | ✅ Xong | `README.md` (§Cấu hình/§Endpoint/§Các mode/§Test/§Tài liệu khác), `AGENTS.md` §2/§3/§4/§6.7, `gemini-proxy-plan.md` §2/§3/§4.5/§6/§8, `docs/openai-compat-spike.md`, plan này. `.gitignore` không đổi. |
-
 ---
 
 ## 8. Tiêu chí chấp nhận (tổng)

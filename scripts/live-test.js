@@ -10,7 +10,7 @@
  *        LIVE_BASE=http://localhost:8787 node scripts/live-test.js
  *
  * ⛔ Không hề chứa/hiện API key (proxy giữ key phía sau).
- * Ng ngân sách upstream ghi ở cột "req" — tổng phải ≤ 28 (plan §2.3).
+ * Ngân sách upstream ghi ở cột "req" — tổng phải ≤ 28 (plan §2.3).
  */
 'use strict';
 

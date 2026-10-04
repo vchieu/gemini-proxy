@@ -10,12 +10,13 @@
  *   - Q2: client OpenAI chuẩn KHÔNG echo field lạ `extra_content` -> replay history
  *     bị Google 400 `Function call is missing a thought_signature`.
  *   -> Kênh duy nhất sống sót qua client là `tool_call_id`, nên nhúng sig vào id
- *      (tái dùng `makeToolCallId`/`parseToolCallId` của `api/translate.js`).
+ *      (dùng `makeToolCallId`/`parseToolCallId` của `utils/toolCallId.js` —
+ *      KHÔNG require `api/translate.js` để tránh phụ thuộc vòng trong `api/`).
  *
  * Không require `api/server.js` (tránh vòng — xem AGENTS.md §7).
  */
 
-const { makeToolCallId, parseToolCallId } = require('./translate');
+const { makeToolCallId, parseToolCallId } = require('../utils/toolCallId');
 
 /**
  * Đọc thoughtSignature từ 1 tool_call Google trả về.
@@ -87,41 +88,84 @@ function requestToUpstream(agentRequest) {
  * Chunk STREAM -> client.
  *
  * @param {object} chunk   payload JSON 1 event SSE (đã parse)
- * @param {{ names?: Record<string|number, string> }} [state]
- *   state do caller giữ theo từng request — dùng khi `function.name` nằm ở delta
- *   TRƯỚC delta mang signature (id chỉ được cấp ở delta đầu nên cần ghi tên lại).
- * @returns {{ chunk: object, changed: boolean, unshimmed: boolean }}
+ * @param {object} [state] state do caller giữ THEO TỪNG REQUEST, gồm:
+ *   - `names`        — tên function đã thấy theo index (sig có thể đến sau delta có `function.name`)
+ *   - `indexById`    — ánh xạ `id` -> index để giữ index ổn định giữa các delta
+ *   - `emitted`, `emittedWithSig` — index nào đã forward id / đã forward id kèm sig
+ *   - `nextIndex`, `lastIndex`    — cấp index mới cho tool_call Google không đánh số
+ *   Caller truyền `{}` cũng được — các field thiếu được khởi tạo tại chỗ.
+ * @returns {{ chunk: object, changed: boolean, unshimmed: boolean, late: boolean }}
  *   `changed`   — caller phải forward `JSON.stringify(chunk)` thay vì payload gốc.
  *   `unshimmed` — có signature nhưng không gắn được vào id (thiếu tên function);
  *                 caller nên WARN: client sẽ làm rơi `extra_content` -> replay 400.
+ *   `late`      — signature đến SAU khi id đã được forward cho index đó; client đã giữ
+ *                 id cũ nên không cập nhật được -> caller nên WARN (replay có thể 400).
  */
 function chunkToClient(chunk, state) {
   // Chuẩn hoá state tại chỗ để caller có thể truyền `{}` — nếu không, mỗi lần gọi
-  // lại tạo object `names` mới và tên function không được ghi nhớ giữa các delta.
+  // lại tạo object mới và tên function / chỉ số tool_call không được ghi nhớ giữa các delta.
   const st = state && typeof state === 'object' ? state : {};
   if (!st.names || typeof st.names !== 'object') st.names = {};
+  if (!st.indexById || typeof st.indexById !== 'object') st.indexById = {};
+  if (!st.emitted || typeof st.emitted !== 'object') st.emitted = {};
+  if (!st.emittedWithSig || typeof st.emittedWithSig !== 'object') st.emittedWithSig = {};
+  if (typeof st.nextIndex !== 'number') st.nextIndex = 0;
+  if (typeof st.lastIndex !== 'number') st.lastIndex = 0;
   const names = st.names;
-  const out = { chunk, changed: false, unshimmed: false };
+  const out = { chunk, changed: false, unshimmed: false, late: false };
   const choices = chunk && chunk.choices;
   if (!Array.isArray(choices)) return out;
   for (const c of choices) {
     const delta = c && c.delta;
     if (!delta || !Array.isArray(delta.tool_calls)) continue;
-    delta.tool_calls.forEach((tc, i) => {
+    const tcs = delta.tool_calls;
+    tcs.forEach((tc, i) => {
       if (!tc || typeof tc !== 'object') return;
-      const idx = typeof tc.index === 'number' ? tc.index : i;
+
+      // (1) `index` — OpenAI spec BẮT BUỘC trên delta `tool_calls` của stream, nhưng
+      // Google KHÔNG gửi (L6: sawIndex=false). Client OpenAI nghiêm ngặt từng làm hỏng
+      // nhánh `translate` vì thiếu field này -> điền vào, CHỈ khi thiếu (không ghi đè).
+      const id = (typeof tc.id === 'string' && tc.id) ? tc.id : null;
+      let idx;
+      if (typeof tc.index === 'number') {
+        idx = tc.index;
+      } else if (id && Object.prototype.hasOwnProperty.call(st.indexById, id)) {
+        idx = st.indexById[id]; // delta lặp lại cùng id -> giữ index cũ
+      } else if (id) {
+        idx = st.nextIndex++; // id mới -> tool_call mới
+      } else if (tcs.length > 1) {
+        idx = i; // nhiều tool_call trong 1 delta mà không id/index -> theo vị trí
+      } else {
+        idx = st.lastIndex; // continuation 1 phần tử -> tool_call đang nói dở
+      }
+      if (idx + 1 > st.nextIndex) st.nextIndex = idx + 1;
+      st.lastIndex = idx;
+      if (id) st.indexById[id] = idx;
+      if (typeof tc.index !== 'number') { tc.index = idx; out.changed = true; }
+
+      // (2) tên function — có thể nằm ở delta khác với signature
       const name = (tc.function && typeof tc.function.name === 'string' && tc.function.name) || names[idx];
       if (name) names[idx] = name;
+
+      // (3) signature -> nhúng vào id, bỏ field lạ client không echo
       const sig = readThoughtSignature(tc);
-      if (!sig) return;
-      if (!name) {
-        // Không có tên -> không dựng được id (id đã phát ở delta trước không sửa lại được)
-        out.unshimmed = true;
-        return;
+      if (sig) {
+        if (!name) {
+          // Không có tên -> không dựng được id (id đã phát ở delta trước không sửa lại được)
+          out.unshimmed = true;
+        } else {
+          tc.id = makeToolCallId(name, sig);
+          delete tc.extra_content;
+          out.changed = true;
+        }
+        // id của index này đã được forward Ở DELTA TRƯỚC mà chưa kèm sig -> client
+        // đã giữ id cũ và không cập nhật lại -> replay history sẽ thiếu signature.
+        if (st.emitted[idx] && !st.emittedWithSig[idx]) out.late = true;
       }
-      tc.id = makeToolCallId(name, sig);
-      delete tc.extra_content;
-      out.changed = true;
+      if (typeof tc.id === 'string' && tc.id) {
+        st.emitted[idx] = true;
+        if (sig) st.emittedWithSig[idx] = true;
+      }
     });
   }
   return out;

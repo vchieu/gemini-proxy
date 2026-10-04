@@ -4,6 +4,8 @@ const { StateStore } = require('../state/store');
 const { _resetRoundRobin } = require('../router/selector');
 const { handleRequest, openStream, Aggregated429Error } = require('../router/fallbackLoop');
 const { Gemini429Error, GeminiError } = require('../client/geminiClient');
+const { estimateTokens } = require('../utils/tokenEstimate');
+const { makeToolCallId } = require('../utils/toolCallId');
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -72,6 +74,70 @@ describe('fallbackLoop upstream_mode=openai_compat', () => {
     assert.equal(tokensUsed, 8, 'usage.total_tokens must drive quota');
     assert.equal(st.inflight_count, 0, 'reservation released after success');
     assert.equal(st.inflight_tokens, 0);
+  });
+
+  it('response WITHOUT usage -> records the token ESTIMATE (not 0)', async () => {
+    // Regression: nhánh openai_compat từng thiếu `|| estimated` -> TPM bị đếm thiếu.
+    const deps = makeDeps({ client: {
+      callOpenAI: async () => ({
+        id: 'chatcmpl-nousage',
+        object: 'chat.completion',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        // không có field usage
+      }),
+    } });
+
+    await handleRequest(req, deps);
+
+    const st = deps.stateStore.get('key-1', 'a');
+    const tokensUsed = (st.token_timestamps || []).reduce((s, e) => s + (e[1] || 0), 0);
+    const expected = estimateTokens(req.messages);
+    assert.ok(expected > 0, 'test premise: estimate must be > 0');
+    assert.equal(tokensUsed, expected, 'quota must fall back to the token estimate');
+  });
+
+  it('applies the signature shim both ways (Case B)', async () => {
+    const SIG = 'SIG_FOR_WIRING_TEST';
+    const sigId = makeToolCallId('get_weather', SIG);
+    const agentRequest = {
+      model: 'auto',
+      messages: [
+        { role: 'user', content: 'weather?' },
+        // client OpenAI chuẩn chỉ echo id/type/function — không còn extra_content
+        { role: 'assistant', content: null, tool_calls: [
+          { id: sigId, type: 'function', function: { name: 'get_weather', arguments: '{}' } },
+        ] },
+        { role: 'tool', tool_call_id: sigId, content: '{}' },
+      ],
+    };
+    let sentBody;
+    const deps = makeDeps({ client: {
+      callOpenAI: async (key, model, body) => {
+        sentBody = body;
+        // Google trả về extra_content (Case B đã xác nhận live)
+        return {
+          id: 'chatcmpl-shim',
+          choices: [{ index: 0, finish_reason: 'tool_calls', message: {
+            role: 'assistant', content: null,
+            tool_calls: [{ id: 'call_google', type: 'function',
+              function: { name: 'get_weather', arguments: '{}' },
+              extra_content: { google: { thought_signature: SIG } } }],
+          } }],
+        };
+      },
+    } });
+
+    const out = await handleRequest(agentRequest, deps);
+
+    // requestToUpstream: extra_content được dựng lại TRƯỚC khi gửi đi
+    const sentTc = sentBody.messages[1].tool_calls[0];
+    assert.deepEqual(sentTc.extra_content, { google: { thought_signature: SIG } },
+      'requestToUpstream must rebuild extra_content from the callsig_ id');
+    // responseToClient: sig được nhúng vào id, extra_content bị bỏ khi trả client
+    const outTc = out.openAiResponse.choices[0].message.tool_calls[0];
+    assert.ok(outTc.id.startsWith('callsig_'), `expected callsig_ id, got ${outTc.id}`);
+    assert.ok(outTc.id.endsWith(`_${SIG}`));
+    assert.equal('extra_content' in outTc, false, 'client must never see extra_content');
   });
 
   it('skips openAiToGemini entirely (raw OpenAI body reaches the client)', async () => {

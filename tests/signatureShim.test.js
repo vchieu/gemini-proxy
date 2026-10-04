@@ -125,6 +125,66 @@ describe('signatureShim (Case B: extra_content <-> callsig_ id)', () => {
     ] } }] }, {});
     assert.equal(out.changed, false);
     assert.equal(out.unshimmed, true, 'caller must WARN — client will drop the signature');
+    assert.equal(out.late, false, 'no id was forwarded yet, so this is not a "late" case');
+  });
+
+  it('chunkToClient fills the missing `index` (Google does not send it — L6 sawIndex=false)', () => {
+    const state = {};
+    // tool_call #0: có id nhưng KHÔNG index
+    const a = chunkToClient({ choices: [{ delta: { tool_calls: [
+      { id: 'callA_1', function: { name: 'one', arguments: '' } },
+    ] } }] }, state);
+    assert.equal(a.changed, true, 'index must be injected so we re-stringify');
+    assert.equal(a.chunk.choices[0].delta.tool_calls[0].index, 0);
+
+    // continuation: không id, không index -> GIỮ index của tool_call đang nói dở
+    const cont = chunkToClient({ choices: [{ delta: { tool_calls: [
+      { function: { arguments: '{"x"' } },
+    ] } }] }, state);
+    assert.equal(cont.chunk.choices[0].delta.tool_calls[0].index, 0, 'continuation keeps index 0');
+
+    // tool_call #1: id khác -> index mới
+    const b = chunkToClient({ choices: [{ delta: { tool_calls: [
+      { id: 'callB_1', function: { name: 'two', arguments: '' } },
+    ] } }] }, state);
+    assert.equal(b.chunk.choices[0].delta.tool_calls[0].index, 1);
+
+    // delta lặp lại cùng id -> KHÔNG đổi index
+    const again = chunkToClient({ choices: [{ delta: { tool_calls: [
+      { id: 'callB_1', function: { arguments: '{}', name: 'two' } },
+    ] } }] }, state);
+    assert.equal(again.chunk.choices[0].delta.tool_calls[0].index, 1);
+
+    // index upstream đã có -> KHÔNG ghi đè
+    const given = chunkToClient({ choices: [{ delta: { tool_calls: [{ index: 7 }] } }] }, {});
+    assert.equal(given.chunk.choices[0].delta.tool_calls[0].index, 7);
+    assert.equal(given.changed, false, 'nothing to change -> payload stays verbatim');
+  });
+
+  it('chunkToClient flags `late` when the signature arrives AFTER the id was forwarded', () => {
+    const state = {};
+    // delta 1: id + name, KHÔNG sig -> id đã tới tay client
+    const first = chunkToClient({ choices: [{ delta: { tool_calls: [
+      { id: 'call_1', function: { name: 'get_weather', arguments: '' } },
+    ] } }] }, state);
+    assert.equal(first.late, false);
+
+    // delta 2: chỉ có sig (không lặp id) -> client đã giữ id cũ, KHÔNG cập nhật được
+    const second = chunkToClient({ choices: [{ delta: { tool_calls: [
+      { extra_content: { google: { thought_signature: SIG } } },
+    ] } }] }, state);
+    assert.equal(second.changed, true, 'we still rewrite this delta for clients that merge it');
+    assert.ok(second.chunk.choices[0].delta.tool_calls[0].id.startsWith('callsig_'));
+    assert.equal(second.late, true, 'caller must WARN — replay history will 400');
+  });
+
+  it('chunkToClient does NOT flag `late` when id and signature travel together', () => {
+    const out = chunkToClient({ choices: [{ delta: { tool_calls: [
+      { id: 'call_1', function: { name: 'get_weather', arguments: '' },
+        extra_content: { google: { thought_signature: SIG } } },
+    ] } }] }, {});
+    assert.equal(out.changed, true);
+    assert.equal(out.late, false, 'client received the id WITH the signature');
   });
 
   it('chunkToClient is a no-op for normal text / usage-only chunks (payload stays verbatim)', () => {

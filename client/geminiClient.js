@@ -21,11 +21,16 @@ class GeminiError extends Error {
   }
 }
 
+// Endpoint OpenAI-compat của Google — CÙNG 1 URL cho stream/không stream,
+// Google phân biệt qua field `stream` trong body (khác với Gemini-native
+// phân biệt qua `:streamGenerateContent`). Auth gửi qua header
+// `Authorization: Bearer <key>` (set ở callOpenAI/callOpenAIStream),
+// KHÔNG nhét key vào query string.
 const OPENAI_COMPAT_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
 
 // Field phải xoá khỏi body trước khi forward tới endpoint OpenAI-compat của Google.
-// Kết quả Phase 0 (spike Q6): mặc định rỗng – nếu spike chứng minh field nào bị từ chối
-// mới thêm vào whitelist này.
+// Kết quả Phase 6 live test (spike Q6 — xem docs/openai-compat-spike.md): mặc định
+// rỗng, vì chưa phát hiện field nào bị Google từ chối.
 const OPENAI_DROP_FIELDS = [];
 
 const QUOTA_RE = /quota|rate|limit|retry/i;
@@ -37,20 +42,6 @@ function buildUrl(model, apiKey, stream) {
     `:${action}?key=${encodeURIComponent(apiKey)}` +
     (stream ? '&alt=sse' : '')
   );
-}
-
-/**
- * Endpoint OpenAI-compat của Google — CÙNG 1 URL cho stream/không stream,
- * Google phân biệt qua field `stream` trong body (khác với Gemini-native
- * phân biệt qua `:streamGenerateContent`).
- * Auth gửi qua header `Authorization: Bearer <key>` (set ở callOpenAI/callOpenAIStream),
- * KHÔNG nhét key vào query string.
- * @param {ApiKeyConfig} key
- * @param {boolean} stream
- * @returns {string}
- */
-function buildOpenAiUrl(key, stream) {
-  return OPENAI_COMPAT_URL;
 }
 
 /**
@@ -151,7 +142,7 @@ async function callOpenAI(key, model, openAiBody, options = {}) {
   let res, text;
   try {
     const body = buildOpenAiBody(openAiBody, model, false);
-    res = await fetch(buildOpenAiUrl(key, false), {
+    res = await fetch(OPENAI_COMPAT_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -176,16 +167,21 @@ async function callOpenAI(key, model, openAiBody, options = {}) {
 }
 
 /**
- * Gọi OpenAI-compatible streaming endpoint.
- * Trả về object mới { ok, status, headers, body } bọc ReadableStream, KHÔNG gán res.body.
- * @param {ApiKeyConfig} key
- * @param {ModelConfig} model
- * @param {object} openAiBody  // format OpenAI chat-completions
- * @param {{timeoutMs?: number}} options
+ * Core dùng chung cho CẢ HAI hàm stream (`callGeminiStream` / `callOpenAIStream`) —
+ * 2 hàm này chỉ khác nhau ở URL + header + body, toàn bộ phần timeout/wrap stream
+ * giống hệt nhau (trước đây bị copy-paste ~50 dòng).
+ *
+ * - Timeout bao trùm cả lúc kết nối, lúc đọc body lỗi và cả lúc đọc stream body
+ *   (idle timeout reset mỗi chunk) — không chỉ lúc mở kết nối.
+ * - Đọc body lỗi ĐÚNG 1 LẦN rồi giao cho `buildHttpError` (Q3: hỗ trợ body mảng).
+ * - Trả object MỚI bọc ReadableStream — KHÔNG gán `res.body`
+ *   (Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng).
+ *
+ * @param {(signal: AbortSignal) => Promise<Response>} doFetch
+ * @param {number} timeoutMs
  * @returns {Promise<{ ok: boolean, status: number, headers: object, body: ReadableStream }>}
  */
-async function callOpenAIStream(key, model, openAiBody, options = {}) {
-  const timeoutMs = options.timeoutMs || 60000;
+async function fetchSse(doFetch, timeoutMs) {
   const controller = new AbortController();
   let timedOut = false;
   const onTimeout = () => { timedOut = true; controller.abort(); };
@@ -193,16 +189,7 @@ async function callOpenAIStream(key, model, openAiBody, options = {}) {
 
   let res;
   try {
-    const body = buildOpenAiBody(openAiBody, model, true);
-    res = await fetch(buildOpenAiUrl(key, true), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${key.api_key}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    res = await doFetch(controller.signal);
   } catch (e) {
     clearTimeout(timer);
     if (timedOut || e.name === 'AbortError') throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
@@ -210,7 +197,6 @@ async function callOpenAIStream(key, model, openAiBody, options = {}) {
   }
 
   if (!res.ok) {
-    // Đọc body ĐÚNG 1 LẦN rồi giao cho buildHttpError (Q3: hỗ trợ body mảng).
     let text = '';
     try {
       text = await res.text();
@@ -225,8 +211,6 @@ async function callOpenAIStream(key, model, openAiBody, options = {}) {
     throw buildHttpError(res.status, text);
   }
 
-  // KHÔNG gán res.body (Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng).
-  // Trả object mới bọc stream, reset idle timeout mỗi chunk.
   const reader = res.body.getReader();
   const resetIdle = () => {
     if (timedOut) return;
@@ -252,6 +236,29 @@ async function callOpenAIStream(key, model, openAiBody, options = {}) {
     },
   });
   return { ok: res.ok, status: res.status, headers: res.headers, body: wrapped };
+}
+
+/**
+ * Gọi OpenAI-compatible streaming endpoint.
+ * Trả về object mới { ok, status, headers, body } bọc ReadableStream, KHÔNG gán res.body.
+ * @param {ApiKeyConfig} key
+ * @param {ModelConfig} model
+ * @param {object} openAiBody  // format OpenAI chat-completions
+ * @param {{timeoutMs?: number}} options
+ * @returns {Promise<{ ok: boolean, status: number, headers: object, body: ReadableStream }>}
+ */
+async function callOpenAIStream(key, model, openAiBody, options = {}) {
+  const timeoutMs = options.timeoutMs || 60000;
+  const body = buildOpenAiBody(openAiBody, model, true);
+  return fetchSse((signal) => fetch(OPENAI_COMPAT_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${key.api_key}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  }), timeoutMs);
 }
 
 /**
@@ -281,68 +288,12 @@ function buildOpenAiBody(body, model, stream) {
  */
 async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
-  const controller = new AbortController();
-  let timedOut = false;
-  const onTimeout = () => { timedOut = true; controller.abort(); };
-  let timer = setTimeout(onTimeout, timeoutMs);
-
-  let res;
-  try {
-    res = await fetch(buildUrl(model, key.api_key, true), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(geminiRequestBody),
-      signal: controller.signal,
-    });
-  } catch (e) {
-    clearTimeout(timer);
-    if (timedOut || e.name === 'AbortError') throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
-    throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
-  }
-
-  if (!res.ok) {
-    // Đọc body ĐÚNG 1 LẦN rồi giao cho buildHttpError (429/403-quota -> Gemini429Error, còn lại GeminiError).
-    let text = '';
-    try {
-      text = await res.text();
-    } catch (e) {
-      if (timedOut || e.name === 'AbortError') {
-        clearTimeout(timer);
-        throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
-      }
-      logger.warn(`Cannot read error body (HTTP ${res.status}): ${e.message}`);
-    }
-    clearTimeout(timer);
-    throw buildHttpError(res.status, text);
-  }
-
-  // KHÔNG gán res.body (Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng).
-  // Trả object mới bọc stream, reset idle timeout mỗi chunk.
-  const reader = res.body.getReader();
-  const resetIdle = () => {
-    if (timedOut) return;
-    clearTimeout(timer);
-    timer = setTimeout(onTimeout, timeoutMs);
-  };
-  const wrapped = new ReadableStream({
-    async pull(ctrl) {
-      try {
-        const { done, value } = await reader.read();
-        if (done) { clearTimeout(timer); ctrl.close(); return; }
-        resetIdle();
-        ctrl.enqueue(value);
-      } catch (err) {
-        clearTimeout(timer);
-        ctrl.error(timedOut ? new GeminiError(`Gemini stream idle timeout after ${timeoutMs}ms`, { status: 504 }) : err);
-      }
-    },
-    cancel(reason) {
-      clearTimeout(timer);
-      controller.abort();
-      return reader.cancel(reason).catch(() => {});
-    },
-  });
-  return { ok: res.ok, status: res.status, headers: res.headers, body: wrapped };
+  return fetchSse((signal) => fetch(buildUrl(model, key.api_key, true), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(geminiRequestBody),
+    signal,
+  }), timeoutMs);
 }
 
 module.exports = { callGemini, callGeminiStream, callOpenAI, callOpenAIStream, Gemini429Error, GeminiError, buildHttpError };

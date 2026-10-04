@@ -155,9 +155,11 @@ async function handleRequest(agentRequest, deps) {
     }
   );
   const upstreamMode = (deps && deps.config && deps.config.upstream_mode) || 'openai_compat';
+  // Cả 2 mode đều fallback về `estimated` khi upstream KHÔNG trả usage — nếu không,
+  // recordSuccess ghi 0 token và TPM bị đếm thiếu (đọc từ review).
   const totalTokens = upstreamMode === 'openai_compat'
-    ? geminiRes.usage && geminiRes.usage.total_tokens
-    : (geminiRes.usageMetadata || {}).totalTokenCount || estimated;
+    ? ((geminiRes.usage && geminiRes.usage.total_tokens) || estimated)
+    : ((geminiRes.usageMetadata || {}).totalTokenCount || estimated);
   // release -> recordSuccess đồng bộ, không await ở giữa
   stateStore.release(pair.key.id, pair.model.name, estimated);
   stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);

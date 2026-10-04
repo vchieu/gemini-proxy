@@ -86,8 +86,20 @@ gắn `usage` vào **chunk đang có `choices`** (`usageOnNormalChunk=2`, `usage
 
 ## Q6 — Field nào bị endpoint từ chối (`OPENAI_DROP_FIELDS`)?
 
-**Đáp án: chưa phát hiện field nào bị từ chối.** Toàn bộ body OpenAI gửi thẳng từ agent
-được chấp nhận → `OPENAI_DROP_FIELDS` giữ **rỗng** trong `client/geminiClient.js`.
+**Đáp án: chưa phát hiện field nào bị từ chối — nhưng mẫu test CÒN HẸP.**
+Toàn bộ body OpenAI gửi thẳng từ agent trong các test L0–L11 được chấp nhận →
+`OPENAI_DROP_FIELDS` giữ **rỗng** trong `client/geminiClient.js`.
+
+**Giới hạn của kết luận này (đọc trước khi tin):**
+- Phase 0 spike riêng (S9) **không được chạy** (thiếu `GEMINI_SPIKE_KEY`), nên chưa có
+  test chủ đích từng field.
+- `scripts/live-test.js` chỉ gửi các field cơ bản (`messages`, `tools`, `tool_choice`,
+  `stream`, `stream_options`, `temperature`…). Chưa thử `parallel_tool_calls`, `store`,
+  `reasoning_effort`, `max_completion_tokens`, `n`, `logprobs`, `response_format`…
+- Quan sát gián tiếp: OpenCode thật đang chạy qua proxy này và **chưa** bị 400 do field lạ.
+
+**Hành động nếu gặp 400 `unknown field` / `not supported`:** thêm đúng tên field vào
+`OPENAI_DROP_FIELDS` (client/geminiClient.js) rồi chạy lại test — không cần đổi chỗ khác.
 
 ## Q7 — 5xx có xảy ra thật không, fallback có đúng không?
 
@@ -109,11 +121,12 @@ Ngoài ra còn thấy:
 
 ## Quan sát thêm (ngoài plan Q1–Q7)
 
-| # | Quan sát | Hệ quả |
+| # | Quan sát | Hệ quả / cách xử lý |
 |---|---|---|
-| 1 | Stream delta `tool_calls` **không có field `index`** | Client OpenAI nghiêm ngặt có thể hỏng. `openai_compat` forward payload gốc nên proxy không tự thêm (khác nhánh `translate`). Nếu cần phải thêm, cần đổi chủ đích. |
-| 2 | `usage` nằm trên chunk có `choices` | Xem Q5 — không ảnh hưởng quota. |
-| 3 | 503 "high demand" xảy ra thường xuyên với free tier | Đã là lý do plan có nhánh 5xx fallback. |
+| 1 | Stream delta `tool_calls` **không có field `index`** | OpenAI spec bắt buộc field này; client OpenAI nghiêm ngặt từng làm hỏng nhánh `translate` vì thiếu. **Đã xử lý:** `api/signatureShim.js` → `chunkToClient` điền `index` vào mọi delta `tool_calls` khi Google không gửi (không ghi đè nếu upstream đã gửi), giữ index ổn định giữa các delta qua `indexById` / `nextIndex` / `lastIndex`. Test: `tests/openaiStreaming.test.js` (Case B stream) + `tests/signatureShim.test.js`. |
+| 2 | Signature có thể đến **sau** delta đã chứa `id` | L6 chỉ pass vì sig đi cùng delta với id. Nếu id đã gửi trước, client giữ id cũ → replay 400. **Đã xử lý (phát hiện):** cờ `late` của `chunkToClient` + WARN ở `openaiPassthrough`. Chưa có giải pháp sửa gốc (muốn sửa thì phải defer chunk như nhánh `translate` — nếu gặp WARN này ngoài thực tế thì mới làm). |
+| 3 | `usage` nằm trên chunk có `choices` | Xem Q5 — không ảnh hưởng quota. |
+| 4 | 503 "high demand" xảy ra thường xuyên với free tier | Đã là lý do plan có nhánh 5xx fallback. |
 
 ---
 

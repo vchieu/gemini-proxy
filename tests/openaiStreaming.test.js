@@ -161,6 +161,52 @@ describe('streamOpenAiPassthrough (upstream_mode=openai_compat)', () => {
     } finally { server.close(); }
   });
 
+  it('Case B stream: tool_call chunk mang thought_signature -> callsig_ id + index điền vào (plan 4.4)', async () => {
+    const store = new StateStore(null);
+    const SIG = 'SIG_STREAM_CASE_B';
+    const toolChunk = (tc) => JSON.stringify({
+      id: 'c1', object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [tc] }, finish_reason: null }],
+    });
+    // Google KHÔNG gửi `index` trên delta tool_calls (L6: sawIndex=false) và gửi sig
+    // ở delta riêng — mô phỏng đúng hành vi đã quan sát.
+    const sse =
+      'data: ' + toolChunk({ id: 'callg_1', type: 'function', function: { name: 'get_weather', arguments: '' } }) + '\n\n' +
+      'data: ' + toolChunk({ function: { arguments: '{"city":"Paris"}' } }) + '\n\n' +
+      'data: ' + toolChunk({ extra_content: { google: { thought_signature: SIG } } }) + '\n\n' +
+      'data: ' + JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n' +
+      'data: [DONE]\n\n';
+    const server = await makeApp(store, {
+      callOpenAIStream: async () => ({ ok: true, status: 200, body: makeReadableStream([sse]) }),
+    });
+    try {
+      const res = await post(server.address().port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+
+      const events = res.body.split('\n\n')
+        .map((s) => s.replace(/^data: /, ''))
+        .filter((s) => s && s !== '[DONE]')
+        .map((s) => JSON.parse(s));
+      const tcDeltas = events
+        .flatMap((p) => (p.choices || []).map((c) => c.delta || {}))
+        .filter((d) => Array.isArray(d.tool_calls))
+        .flatMap((d) => d.tool_calls);
+
+      assert.ok(tcDeltas.length >= 3, `expected the tool_call deltas, got ${tcDeltas.length}`);
+      assert.ok(tcDeltas.every((tc) => typeof tc.index === 'number'),
+        `every tool_call delta must carry a numeric index, got ${JSON.stringify(tcDeltas.map((t) => t.index))}`);
+      assert.deepEqual(tcDeltas.map((t) => t.index), [0, 0, 0],
+        'continuation deltas must stay on the same index');
+
+      const lastWithId = tcDeltas.filter((t) => typeof t.id === 'string').pop();
+      assert.ok(lastWithId.id.startsWith('callsig_'), `id must carry the signature, got ${lastWithId.id}`);
+      assert.ok(lastWithId.id.endsWith(`_${SIG}`), 'signature must round-trip through the id');
+      assert.ok(tcDeltas.every((t) => !('extra_content' in t)),
+        'client must never see extra_content (it drops the field anyway)');
+      assert.ok(!res.body.includes('extra_content'), 'payload forwarded must not contain extra_content');
+    } finally { server.close(); }
+  });
+
   it('mid-stream error -> NO [DONE], NO recordSuccess, reservation released', async () => {
     const store = new StateStore(null);
     const errorStream = new ReadableStream({

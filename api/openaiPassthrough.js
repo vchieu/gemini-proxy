@@ -55,7 +55,7 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
 
   res.on('close', () => {
     if (!res.writableEnded) {
-      clientAborted = true; // client ngát → KHÔNG recordSuccess, KHÔNG [DONE]
+      clientAborted = true; // client ngắt → KHÔNG recordSuccess, KHÔNG [DONE]
       reader.cancel().catch(() => {});
     }
   });
@@ -103,6 +103,11 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
     const shim = chunkToClient(parsed, shimState);
     if (shim.unshimmed) {
       logger.warn('openai_passthrough: không gắn được thoughtSignature vào tool_call id (thiếu tên function) — replay history có thể 400', {
+        model: pair.model.name,
+      });
+    }
+    if (shim.late) {
+      logger.warn('openai_passthrough: thoughtSignature đến SAU khi id đã gửi cho client — client giữ id cũ, replay history có thể 400', {
         model: pair.model.name,
       });
     }
