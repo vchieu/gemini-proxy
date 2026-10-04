@@ -21,6 +21,7 @@ agent → api/server.js → router/fallbackLoop.js → router/selector.js
   → state/cooldown.js (isAvailable) + state/store.js (StateStore)
   → client/geminiClient.js → Google API
   → 429? client/errorParser.js → store.setCooldown → chọn cặp khác (loop)
+  → 5xx upstream (500/502/503/504)? → chọn cặp khác NGAY (KHÔNG cooldown, KHÔNG tính quota)
   → thành công? store.recordSuccess → api/translate.js → trả OpenAI format
 ```
 
