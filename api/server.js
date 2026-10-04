@@ -1,5 +1,6 @@
 const express = require('express');
 const { handleRequest, openStream, Aggregated429Error } = require('../router/fallbackLoop');
+const { streamOpenAiPassthrough } = require('./openaiPassthrough');
 const { geminiChunkToOpenAiChunk, attachThoughtSignature } = require('./translate');
 const { logger } = require('../utils/logger');
 
@@ -80,7 +81,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         });
       }
     }
-    res.json({ now, strategy: config.strategy, pairs });
+    res.json({ now, strategy: config.strategy, upstream_mode: (config && config.upstream_mode) || 'translate', pairs });
   });
 
   // Mount Gemini-native router at /v1beta
@@ -101,8 +102,9 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       try {
         const result = await handleRequest(agentRequest, deps);
         // tool_call không có thoughtSignature -> id ở format cũ, replay history Gemini 3 sẽ 400
+        // (chỉ áp dụng khi translate: openai_compat pass nguyên response Google, không qua makeToolCallId)
         const tcs = result.openAiResponse?.choices?.[0]?.message?.tool_calls;
-        if (Array.isArray(tcs)) {
+        if (config.upstream_mode !== 'openai_compat' && Array.isArray(tcs)) {
           const bad = tcs.filter((t) => !String(t.id || '').startsWith('callsig_'));
           if (bad.length > 0) {
             logger.warn(`Response có ${bad.length} tool_call KHÔNG kèm thoughtSignature — replay history sẽ 400 với Gemini 3`, {
@@ -128,6 +130,12 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     }
     const { upstream, pair, release } = handle;
     logger.info(`Stream start: key=${pair.key.id} model=${pair.model.name}`);
+
+    // openai_compat: passthrough SSE ở mức event (không defer thoughtSignature —
+    // signature do Google endpoint tự lo, xem PLAN-openai-compat-migration.md Phase 4)
+    if (config.upstream_mode === 'openai_compat') {
+      return streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi });
+    }
 
     let reader;
     try {

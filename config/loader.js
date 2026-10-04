@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const VALID_STRATEGIES = ['round_robin_key_then_model', 'priority_model_first'];
+const VALID_UPSTREAM_MODES = ['translate', 'openai_compat'];
 const DEFAULT_LIMITS = { rpm: 5, rpd: 20, tpm: 250000 };
 
 /**
@@ -78,7 +79,11 @@ function loadConfig(configDir) {
     max_fallback_attempts: settingsRaw.max_fallback_attempts !== undefined ? settingsRaw.max_fallback_attempts : 12,
     respect_agent_model: settingsRaw.respect_agent_model === true,
     default_cooldown_seconds: settingsRaw.default_cooldown_seconds !== undefined ? settingsRaw.default_cooldown_seconds : 30,
+    upstream_mode: (process.env.UPSTREAM_MODE || settingsRaw.upstream_mode || 'translate').trim(),
   };
+  if (!VALID_UPSTREAM_MODES.includes(settings.upstream_mode)) {
+    throw new Error(`config.json: upstream_mode must be one of ${VALID_UPSTREAM_MODES.join(', ')}`);
+  }
   if (typeof settings.port !== 'number' || !(settings.port > 0 && settings.port < 65536)) {
     throw new Error('config.json: port must be 1..65535');
   }

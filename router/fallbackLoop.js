@@ -63,6 +63,7 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   const maxAttempts = (config && config.max_fallback_attempts) || 12;
   const defaultCooldown = (config && config.default_cooldown_seconds) || DEFAULT_COOLDOWN_SECONDS;
   const timeoutMs = (config && config.request_timeout_ms) || 60000;
+  const mode = (config && config.upstream_mode) || 'translate';
 
   let candidateModels = models;
   const requestedModel = agentRequest && agentRequest.model;
@@ -74,7 +75,8 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   const estimated = options.geminiBody
     ? estimateTokens(options.geminiBody)
     : estimateTokens(agentRequest && agentRequest.messages ? agentRequest.messages : agentRequest);
-  const geminiBody = options.geminiBody || openAiToGemini(agentRequest || {});
+  const geminiBody = options.geminiBody
+    || (mode === 'openai_compat' ? undefined : openAiToGemini(agentRequest || {}));
 
   const maxTpm = Math.max(...candidateModels.map((m) => m.limits.tpm));
   if (estimated > maxTpm) {
@@ -106,7 +108,9 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
 
     logger.info(`Attempt ${attempts + 1}: trying key=${pair.key.id} model=${pair.model.name}`);
     try {
-      const value = await call(pair, { geminiBody, estimated, timeoutMs });
+      const ctx = { geminiBody, estimated, timeoutMs };
+      if (mode === 'openai_compat') ctx.openAiBody = agentRequest;
+      const value = await call(pair, ctx);
       return { value, pair, estimated, attempts: attempts + 1 };
     } catch (e) {
       stateStore.release(pair.key.id, pair.model.name, estimated);
@@ -140,13 +144,23 @@ async function handleRequest(agentRequest, deps) {
   const { geminiClient, stateStore } = deps;
   const { value: geminiRes, pair, estimated, attempts } = await withFallback(
     agentRequest, deps,
-    (p, ctx) => geminiClient.callGemini(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs })
+    (p, ctx) => {
+      // Sử ctx.openAiBody nếu có (mode openai_compat), ngược lại dùng geminiBody
+      const body = ctx.openAiBody || ctx.geminiBody;
+      if (ctx.openAiBody) return geminiClient.callOpenAI(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
+      return geminiClient.callGemini(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
+    }
   );
-  const totalTokens = (geminiRes.usageMetadata || {}).totalTokenCount || estimated;
+  const upstreamMode = deps && deps.config && deps.config.upstream_mode || 'translate';
+  const totalTokens = upstreamMode === 'openai_compat'
+    ? geminiRes.usage && geminiRes.usage.total_tokens
+    : (geminiRes.usageMetadata || {}).totalTokenCount || estimated;
   // release -> recordSuccess đồng bộ, không await ở giữa
   stateStore.release(pair.key.id, pair.model.name, estimated);
   stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
-  const openAiResponse = geminiToOpenAi(geminiRes, pair.model.name);
+  const openAiResponse = upstreamMode === 'openai_compat'
+    ? geminiRes
+    : geminiToOpenAi(geminiRes, pair.model.name);
   logger.info(`Success with key=${pair.key.id} model=${pair.model.name}`, { tokens: totalTokens });
   return { openAiResponse, usedKeyId: pair.key.id, usedModel: pair.model.name, attempts };
 }
@@ -160,7 +174,12 @@ async function openStream(agentRequest, deps) {
   const { geminiClient, stateStore } = deps;
   const { value: upstream, pair, estimated } = await withFallback(
     agentRequest, deps,
-    (p, ctx) => geminiClient.callGeminiStream(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs })
+    (p, ctx) => {
+      // Sử ctx.openAiBody nếu có (mode openai_compat), ngược lại dùng geminiBody
+      const body = ctx.openAiBody || ctx.geminiBody;
+      if (ctx.openAiBody) return geminiClient.callOpenAIStream(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
+      return geminiClient.callGeminiStream(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
+    }
   );
   let released = false;
   const release = () => {

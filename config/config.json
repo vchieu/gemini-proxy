@@ -6,5 +6,6 @@
   "request_timeout_ms": 60000,
   "max_fallback_attempts": 12,
   "respect_agent_model": false,
-  "default_cooldown_seconds": 30
+  "default_cooldown_seconds": 30,
+  "upstream_mode": "translate"
 }

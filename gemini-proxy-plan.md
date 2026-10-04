@@ -19,38 +19,42 @@ khi gặp 429 — agent không cần biết phía sau có fallback.
 ```
 agent → api/server.js → router/fallbackLoop.js → router/selector.js
   → state/cooldown.js (isAvailable) + state/store.js (StateStore)
-  → client/geminiClient.js → Google API
+  → [upstream_mode=translate]     client/geminiClient.js → Google generateContent
+  → [upstream_mode=openai_compat] client/geminiClient.js → Google /v1beta/openai/chat/completions
   → 429? client/errorParser.js → store.setCooldown → chọn cặp khác (loop)
   → 5xx upstream (500/502/503/504)? → chọn cặp khác NGAY (KHÔNG cooldown, KHÔNG tính quota)
-  → thành công? store.recordSuccess → api/translate.js → trả OpenAI format
+  → thành công? store.recordSuccess → [translate] api/translate.js → trả OpenAI format
+                                 ↘ [openai_compat] trả nguyên payload Google
 ```
 
 **Luồng streaming:**
 ```
 agent → POST /v1/chat/completions (stream: true)
-  → openStream() → withFallback() → callGeminiStream()
+  → openStream() → withFallback() → callGeminiStream() | callOpenAIStream()
   → 429? fallback sang cặp khác (trước khi gửi byte đầu)
-  → thành công? ghi SSE chunks → client
+  → [translate]     server.js defer thoughtSignature → ghi SSE chunks → client
+  → [openai_compat] api/openaiPassthrough.js (gom event, lọc usage-only, tự ghi [DONE])
   → client disconnect? cancel upstream, KHÔNG recordSuccess
 ```
 
-**Bản dịch format:** `api/translate.js` (`openAiToGemini`, `geminiToOpenAi`, `geminiChunkToOpenAiChunk`).
+**Bản dịch format:** `api/translate.js` (`openAiToGemini`, `geminiToOpenAi`, `geminiChunkToOpenAiChunk`) — **chỉ dùng khi `upstream_mode=translate`**.
 
 ## 3. Module contract
 
 | Module | File | Export chính / signature |
 |---|---|---|
 | Bootstrap | `index.js` | `main()` — load config → `StateStore` → `createServer` → `listen` + shutdown handler |
-| Config Loader | `config/loader.js` | `loadConfig(configDir) → { keys, models, settings }` |
+| Config Loader | `config/loader.js` | `loadConfig(configDir) → { keys, models, settings }`; `settings.upstream_mode` ∈ `{translate, openai_compat}` (mặc định `translate`), env `UPSTREAM_MODE` override |
 | State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()` (atomic write qua .tmp + rename; lược bỏ inflight — transient), `reserve(k,m,est)`, `release(k,m,est)`, `resetDailyIfNeeded(k,m,now)`, `minCooldownRemaining(now)`, `snapshot()`, `flush()` (huỷ debounce + persist, dùng khi SIGINT/SIGTERM) |
 | Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` (THUẦN, không mutate pairState; cộng `inflight_count`/`inflight_tokens` vào RPD/RPM/TPM — edge case #3). Reset daily_count gọi riêng qua `StateStore.resetDailyIfNeeded(k,m,now)` |
 | Selector | `router/selector.js` | `selectPair(..., strategy?)` (thuần, không side-effect; `strategy: 'round_robin_key_then_model' \| 'priority_model_first'`) + `selectAndReserve(..., strategy?)` (select + `reserve` nguyên tử, caller BẮT BUỘC `release` mọi nhánh kết thúc) → `SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
-| Fallback | `router/fallbackLoop.js` | `handleRequest(agentRequest, { models, keys, stateStore, geminiClient, config }) → Promise<{ openAiResponse, usedKeyId, usedModel, attempts }>`; `openStream(agentRequest, deps) → Promise<{ upstream, pair, estimated, release }>` (fallback 429/5xx ở giai đoạn mở stream, caller phải `release()`); `handleNativeRequest(requestedModel, geminiBody, deps)` / `openNativeStream(requestedModel, geminiBody, deps)` — bản native cho Gemini passthrough (body Gemini gốc truyền qua `options.geminiBody`, không qua `openAiToGemini`); `class Aggregated429Error`; chính sách fallback: **429** → set cooldown theo retryDelay, **HTTP 5xx upstream (500/502/503/504)** → fallback ngay không cooldown (xem §5), lỗi khác trả ngay |
+| Fallback | `router/fallbackLoop.js` | `handleRequest(...)`, `openStream(...)`, `handleNativeRequest(...)`, `openNativeStream(...)`, `class Aggregated429Error`; **rẽ nhánh theo `config.upstream_mode`**: `translate` → `callGemini` + `openAiToGemini`/`geminiToOpenAi`; `openai_compat` → `callOpenAI`/`callOpenAIStream` (body OpenAI nguyên bản, chỉ đổi `model`); chính sách fallback: **429** → set cooldown theo retryDelay, **HTTP 5xx upstream (500/502/503/504)** → fallback ngay không cooldown (xem §5), lỗi khác trả ngay |
 | Gemini Native | `api/geminiNative.js` | `createGeminiNativeRouter(deps) → express.Router`; mount tại `/v1beta` (xem `api/server.js`); `POST /models/:modelAction` (generateContent / streamGenerateContent), `GET /models`; **passthrough**: không dịch format, stream forward byte SSE nguyên bản + **`res.end()` bắt buộc khi stream xong** (thiếu → client treo vô hạn), không ghi `[DONE]`; lỗi trả theo format Google `{ error: { code, message, status } }` (giữ nguyên body Google nếu có) |
-| Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)` trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc, vì `Response.body` không gán được); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError`; lỗi HTTP dựng qua helper `buildHttpError(status, text)` — **body đọc đúng 1 lần ở caller** rồi truyền `text`; 429 hoặc 403 có message quota/rate/limit/retry → `Gemini429Error` (kèm `retryDelaySeconds`), còn lại → `GeminiError("Gemini error <status>: ...")`; **`GeminiError.body` là JSON Google đã parse** (hoặc `undefined` nếu không phải JSON object — không bọc giả `{ error: { message } }`) |
+| Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)`, **`callOpenAI(key, model, openAiBody, {timeoutMs?})`**, **`callOpenAIStream(...)`** (endpoint OpenAI-compat `/v1beta/openai/chat/completions`, `Authorization: Bearer`); trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError`; lỗi HTTP dựng qua helper `buildHttpError(status, text)` — **body đọc đúng 1 lần ở caller** rồi truyền `text`, hiểu cả body JSON mảng `[{error:{...}}]`; 429 hoặc 403 có message quota/rate/limit/retry → `Gemini429Error` (kèm `retryDelaySeconds`), còn lại → `GeminiError("Gemini error <status>: ...")`; **`GeminiError.body` là JSON Google đã parse** (hoặc `undefined` nếu không phải JSON object) |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
-| API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app`; mount router Gemini-native tại `/v1beta` — route `POST /v1beta/models/:modelAction`, `GET /v1beta/models`; che `key=` trong access log |
-| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, modelName, streamId, created, toolCallIndexOffset?)`; tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse` |
+| API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app`; mount router Gemini-native tại `/v1beta` — route `POST /v1beta/models/:modelAction`, `GET /v1beta/models`; **rẽ nhánh `upstream_mode`**: `translate` → `handleRequest` + defer thoughtSignature, `openai_compat` → `streamOpenAiPassthrough` (stream) / `handleRequest` bỏ qua `translate` (non-stream); che `key=` trong access log |
+| OpenAI Passthrough | `api/openaiPassthrough.js` | `streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi })` — stream SSE ở mức event cho `upstream_mode=openai_compat`: gom event `data:` đúng spec, forward payload **gốc** (không parse→stringify lại), lọc chunk usage-only `choices:[]` khi agent không xin `stream_options.include_usage`, tự ghi `[DONE]` nếu upstream thiếu; mọi nhánh `release()` đúng 1 lần + luôn `res.end()`; client ngắt → `reader.cancel()`, không `recordSuccess`, không `[DONE]`; không `require` `api/server.js` (tránh vòng) |
+| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, modelName, streamId, created, toolCallIndexOffset?)`; tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse`; **legacy — chỉ dùng khi `upstream_mode=translate`** |
 | Token estimate | `utils/tokenEstimate.js` | `estimateTokens(messages) → number` (heuristic chars/4 + 4 token overhead/message) |
 | Time | `utils/time.js` | `nextMidnightPacific(nowMs) → ms` |
 | Logger | `utils/logger.js` | `logger.{debug,info,warn,error}`, `createLogger(level)` |
@@ -157,6 +161,11 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 - **Response:** `functionCall` → `tool_calls`, `finish_reason: "tool_calls"`. Streaming:
   `delta.tool_calls[i]` kèm `index` tăng dần giữa các chunk (tham số `toolCallIndexOffset`,
   `server.js` giữ counter) — OpenAI spec bắt buộc `index`, client gom delta theo index.
+- **OpenAI-compatible mode (`upstream_mode=openai_compat`):** bypass `translate` entirely.
+  Body forwarded directly to Google's `POST /v1beta/openai/chat/completions` with
+  `Authorization: Bearer <key>`. Model field overridden with selected pair's model name.
+  Field `OPENAI_DROP_FIELDS` (mặc định rỗng) có thể định nghĩa các field cần xoá trước khi
+  forward. Sử dụng `callOpenAI`/`callOpenAIStream` từ `client/geminiClient.js`.
 
 ## 5. Edge cases
 
@@ -214,9 +223,17 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
   "request_timeout_ms": 60000,
   "max_fallback_attempts": 12,
   "respect_agent_model": false,
-  "default_cooldown_seconds": 30
+  "default_cooldown_seconds": 30,
+  "upstream_mode": "translate"
 }
 ```
+
+`upstream_mode`:
+- `"translate"` (mặc định) — dịch format OpenAI ↔ Gemini native qua `api/translate.js`.
+- `"openai_compat"` — passthrough body OpenAI gốc tới endpoint OpenAI-compat của Google
+  `/v1beta/openai/chat/completions` (dùng `callOpenAI`/`callOpenAIStream`), bỏ qua `api/translate.js`.
+- Override bằng biến môi trường `UPSTREAM_MODE` (ưu tiên hơn config file); giá trị ngoài
+  2 giá trị trên → `loadConfig` ném lỗi.
 
 ## 7. API endpoints
 
@@ -235,4 +252,4 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 npm test
 ```
 
-Kỳ vọng: **70/70 pass** (2026-10-04; 2026-10-02 gồm tool/function-calling tests, 2026-10-03 thêm 6 test native router, 2026-10-04 thêm 12 test `geminiClient` error handling với `Response` thật).
+Kỳ vọng: **106/106 pass** (2026-10-04; 2026-10-02 gồm tool/function-calling tests, 2026-10-03 thêm 6 test native router, 2026-10-04 thêm 12 test `geminiClient` error handling với `Response` thật, cùng ngày thêm 36 test cho nhánh `upstream_mode=openai_compat`: `configLoader`, `openaiClient`, `openaiFallback`, `openaiStreaming`).
