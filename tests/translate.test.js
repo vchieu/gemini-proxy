@@ -164,9 +164,8 @@ describe('translate', () => {
         { role: 'tool', tool_call_id: tcs[1].id, content: '07:00' },
       ],
     });
-    const responses = g.contents
-      .filter((c) => c.parts.some((p) => p.functionResponse))
-      .map((c) => c.parts.find((p) => p.functionResponse).functionResponse.name);
+    const responses = g.contents.flatMap((c) => c.parts)
+      .filter((p) => p.functionResponse).map((p) => p.functionResponse.name);
     assert.deepEqual(responses, ['get_weather', 'get_time']);
   });
 
@@ -182,9 +181,8 @@ describe('translate', () => {
         { role: 'tool', tool_call_id: 'call_2', content: '07:00' },
       ],
     });
-    const responses = g.contents
-      .filter((c) => c.parts.some((p) => p.functionResponse))
-      .map((c) => c.parts.find((p) => p.functionResponse).functionResponse.name);
+    const responses = g.contents.flatMap((c) => c.parts)
+      .filter((p) => p.functionResponse).map((p) => p.functionResponse.name);
     assert.deepEqual(responses, ['get_weather', 'get_time']);
   });
 

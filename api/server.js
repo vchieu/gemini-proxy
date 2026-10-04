@@ -304,7 +304,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         for (const line of lines) handleLine(line);
       }
       if (!clientAborted && buffer) handleLine(buffer); // dòng cuối không có '\n'
-      if (dataLines.length > 0) processEvent(dataLines.join('\n')); // event cuối thiếu dòng trống
+      if (!clientAborted && dataLines.length > 0) processEvent(dataLines.join('\n')); // event cuối thiếu dòng trống
       dataLines = [];
       streamCompleted = !clientAborted;
     } catch (e) {

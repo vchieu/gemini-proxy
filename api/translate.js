@@ -115,7 +115,7 @@ function openAiToGemini(openAiRequestBody) {
       systemInstruction = { parts: [{ text }] };
     } else if (role === 'assistant') {
       // Assistant message có thể chứa tool_calls
-      const parts = normalizeContent(m.content);
+      let parts = normalizeContent(m.content);
       if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
         for (const tc of m.tool_calls) {
           if (tc.type === 'function' && tc.function) {
@@ -131,19 +131,26 @@ function openAiToGemini(openAiRequestBody) {
             });
           }
         }
+        // Gom text rỗng khi có functionCall -> Gemini API reject text rỗng kèm functionCall
+        parts = parts.filter((p) => p.text !== '');
+        if (parts.length === 0) parts.push({ text: '' }); // phòng tool_calls không hợp lệ
       }
       contents.push({ role: 'model', parts });
     } else if (role === 'tool') {
       // Tool result -> functionResponse
       const toolCallId = m.tool_call_id;
       const name = extractToolName(toolCallId, m, contents);
-      const response = typeof m.content === 'string'
-        ? safeJsonParse(m.content) || { result: m.content }
-        : { result: m.content };
-      contents.push({
-        role: 'user',
-        parts: [{ functionResponse: { name: name || 'unknown', response } }],
-      });
+      const response = toStructResponse(m.content);
+      const frPart = { functionResponse: { name: name || 'unknown', response } };
+      const last = contents[contents.length - 1];
+      if (last && last.role === 'user' && last.parts.length > 0 && last.parts.every((p) => p.functionResponse)) {
+        last.parts.push(frPart);   // gộp vào turn tool-result liền trước
+      } else {
+        contents.push({
+          role: 'user',
+          parts: [frPart],
+        });
+      }
     } else {
       // user / default
       contents.push({ role: 'user', parts: normalizeContent(m.content) });
@@ -219,6 +226,24 @@ function extractToolName(toolCallId, toolMsg, contents) {
 function safeJsonParse(str) {
   if (typeof str !== 'string') return undefined;
   try { return JSON.parse(str); } catch (_) { return undefined; }
+}
+
+/** Đảm bảo `functionResponse.response` luôn là JSON Object (Struct).
+ * - Nếu content là string -> parse JSON, nếu parse thành công và là object/array -> dùng kết quả,
+ *   nếu parse thành công nhưng là primitive -> bọc {result: parsedValue},
+ *   nếu parse thất bại -> bọc {result: content}.
+ * - Nếu content là object (không phải string) -> nếu là array hoặc primitive -> bọc {result: content},
+ *   nếu là object -> dùng trực tiếp.
+ * - Nếu content là null/undefined -> {result: null}.
+ */
+function toStructResponse(content) {
+  let v = content;
+  if (typeof content === 'string') {
+    const p = safeJsonParse(content);
+    if (p !== undefined && p !== null) v = p;
+  }
+  if (v !== null && typeof v === 'object' && !Array.isArray(v)) return v;
+  return { result: v };
 }
 
 function mapFinishReason(fr) {

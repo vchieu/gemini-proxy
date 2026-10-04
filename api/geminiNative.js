@@ -87,6 +87,7 @@ async function streamNative(req, res, requestedModel, body, deps) {
   res.on('close', () => {
     if (!res.writableEnded) {
       clientAborted = true;
+      reader.cancel().catch(() => {});
     }
   });
 
