@@ -286,12 +286,13 @@ Chạy full test.
 
 ## Phase 5 — Tổng kiểm unit trước khi live
 
-- Chạy `node --test tests/*.test.js`: **106/106 xanh, 19 suite** (2026-10-04) — gồm 70 test cũ
+- Chạy `node --test tests/*.test.js`: **118/118 xanh, 20 suite** (2026-10-04) — gồm 70 test cũ
   (không test nào bị xoá/làm yếu) + **36 test mới**: `tests/configLoader.test.js` (5),
   `tests/openaiClient.test.js` (9), `tests/openaiFallback.test.js` (11),
-  `tests/openaiStreaming.test.js` (11).
-- Số test thực tế: **106** (đã ghi vào `README.md` §Test, `AGENTS.md` §4, `gemini-proxy-plan.md` §8).
-- Soát nhanh bằng mắt: không có `console.log(api_key)`; không `require` vòng (`api/openaiPassthrough.js` không require `api/server.js`).
+  `tests/openaiStreaming.test.js` (11) + **12 test `tests/signatureShim.test.js`** (thêm sau khi
+  xác định Case B trong Phase 6).
+- Số test thực tế: **118** (đã ghi vào `README.md` §Test, `AGENTS.md` §4, `gemini-proxy-plan.md` §8).
+- Soát nhanh bằng mắt: không có `console.log(api_key)`; không `require` vòng (`api/openaiPassthrough.js` không require `api/server.js`; `api/signatureShim.js` chỉ require `./translate`).
 
 ---
 
@@ -335,12 +336,12 @@ Tổng ≤ 28 request. Nếu một kịch bản FAIL: **đọc log bằng tool �
 - Có 503 thật không; nếu có: fallback không cooldown đúng không.
 - Log WARN bất thường (field lạ, chunk không parse được…).
 
-### 6.4 Điều kiện hoàn tất Phase 6
+### 6.4 Điều kiện hoàn tất Phase 6 — ✅ ĐÃ HOÀN THÀNH (2026-10-04)
 Mọi L-test PASS (L10/L11 được phép bỏ qua **chỉ khi** hết ngân sách quota — ghi rõ lý do). Sau đó:
-1. Đổi mặc định `upstream_mode` thành `"openai_compat"` trong `config/loader.js` (giá trị default) và `config/config.json`.
-2. Chạy lại unit test; sửa các test phụ thuộc mặc định cũ (ví dụ test dựng server với `config:{}` mà mong đợi hành vi `translate` → thêm `upstream_mode:'translate'` rõ ràng vào config của test đó). **Không xoá test nào.**
-3. Restart server **không** có `UPSTREAM_MODE`, chạy lại nhanh L1, L2, L3, L4 để xác nhận mặc định mới hoạt động (≤ 5 request).
-4. Tắt server.
+1. ✅ Đổi mặc định `upstream_mode` thành `"openai_compat"` trong `config/loader.js` (giá trị default) và `config/config.json`.
+2. ✅ Chạy lại unit test; sửa các test phụ thuộc mặc định cũ (test dựng server với `config:{}` mà mong đợi hành vi `translate` → thêm `upstream_mode:'translate'` rõ ràng: `tests/streaming.test.js`, `tests/selectorFallback.test.js`, `tests/concurrency.test.js`, `tests/geminiClient.test.js`). **Không xoá test nào** (70 test cũ còn nguyên).
+3. ✅ Restart server **không** có `UPSTREAM_MODE`, chạy lại nhanh L1, L2, L3, L4 → **4/4 PASS**; `/admin/status` trả `upstream_mode: openai_compat`.
+4. ✅ Tắt server.
 
 ---
 
@@ -355,21 +356,34 @@ Cập nhật **tất cả** mục dưới, nếu không thì phải nêu lý do 
 - `.gitignore`: không cần đổi (không tạo file chứa secret). Kiểm tra bạn **không** commit log/PID/file tạm.
 
 Checklist tự kiểm (đánh dấu từng dòng trong báo cáo):
-- [x] README mô tả đúng endpoint/config/cách chạy — §Cấu hình (`upstream_mode` + env `UPSTREAM_MODE`), §Endpoint (`/v1/chat/completions`, `/admin/status`), §Test (106)
-- [x] Bảng contract AGENTS §3 khớp signature thực tế — Config Loader / Fallback / Gemini Client / OpenAI Passthrough (dòng mới) / API Layer / Translate
-- [x] Con số test kỳ vọng đúng — **106/106, 19 suite**
-- [x] Lệch spec đã ghi lý do — `gemini-proxy-plan.md` §2/§3/§4.5/§6 + `AGENTS.md` §2
+- [x] README mô tả đúng endpoint/config/cách chạy — §Cấu hình (`upstream_mode` mặc định `openai_compat` + env `UPSTREAM_MODE`), §Endpoint (`/v1/chat/completions`, `/admin/status`), §Các mode (`### openai_compat` / `### Legacy`), §Test (118), §Tài liệu khác
+- [x] Bảng contract AGENTS §3 khớp signature thực tế — Config Loader / Fallback / Gemini Client / OpenAI Passthrough / **OpenAI Signature Shim (dòng mới)** / API Layer / Translate
+- [x] Con số test kỳ vọng đúng — **118/118, 20 suite**
+- [x] Lệch spec đã ghi lý do — `gemini-proxy-plan.md` §2/§3/§4.5/§6/§8 + `AGENTS.md` §2/§3/§4/§6.7 + `docs/openai-compat-spike.md`
 - [x] Đã chạy full test suite, kết quả có trong báo cáo
+
+### Kết quả Phase 6 (live test)
+
+Bảng chi tiết: **`docs/openai-compat-spike.md`** (L0–L11 + kết quả chạy lại sau khi flip default).
+
+| Hạng mục | Kết quả |
+|---|---|
+| L0–L11 | Tất cả PASS (L2b ban đầu FAIL vì kỳ vọng sai — upstream gắn `usage` vào chunk **có** `choices`, đã sửa test cho đúng thực tế; L5/L6 FAIL 400 trước khi có shim, PASS sau khi thêm `api/signatureShim.js`) |
+| Ngân sách | **28 request thành công** được ghi quota (tổng task ≤ 40 theo §2.3); tổng attempt ≥ 40 do retry khi 503 — **user đã phê duyệt vượt** |
+| 429 thật | Không gặp; 503 thật gặp **5 lần** → fallback đúng, không cooldown (Q7) |
+| 400 thật | Gặp (L5 trước shim, L8b chủ đích) → propagates, không cooldown |
+| Log WARN bất thường | 1 lần: `openai_passthrough: không gắn được thoughtSignature…` — không xảy ra trong các lần chạy cuối |
+| 6.4 flip default | ✅ Xong, xác nhận lại bằng L0–L4 không cần env |
 
 ### Trạng thái thực hiện (ghi rõ deviation so với plan)
 
 | Phase | Trạng thái | Lý do / ghi chú |
 |---|---|---|
-| 0 (spike) | ⏸ Chưa chạy | Cần `GEMINI_SPIKE_KEY` (plan §10 yêu cầu dừng hỏi user nếu thiếu). Hệ quả: `OPENAI_DROP_FIELDS` để **rỗng**, `api/signatureShim.js` **chưa tạo** (Case A/B/C chưa xác định) — chờ Phase 6 live. |
-| 1–4 | ✅ Xong | Code + 36 unit test, default vẫn `translate`. |
-| 5 | ✅ Xong | **106/106 pass**, 19 suite. |
-| 6 (live) | ⏸ Chưa chạy | Cần ngân sách quota (≤ 28 request) + `UPSTREAM_MODE=openai_compat` restart server; điều kiện 6.4 (đổi default `openai_compat`) **chưa thực hiện**. |
-| 7 (docs) | ✅ Xong | `README.md`, `AGENTS.md` §2/§3/§4, `gemini-proxy-plan.md` §2/§3/§6/§8, plan này. `docs/openai-compat-spike.md` chưa tạo vì Phase 0 chưa chạy. |
+| 0 (spike) | ⚠️ **Lệch plan** | Không có `GEMINI_SPIKE_KEY` → **không tạo** `scripts/spike-openai-compat.js`. Thay vào đó, **Q1–Q7 được trả lời trực tiếp từ Phase 6 live test** và ghi vào `docs/openai-compat-spike.md`. Hệ quả: `OPENAI_DROP_FIELDS` giữ **rỗng** (Q6 không phát hiện field bị từ chối), schema không cần sanitize (Q4). |
+| 1–4 | ✅ Xong | Code + 36 unit test. |
+| 5 | ✅ Xong | **118/118 pass**, 20 suite (kèm 12 test shim thêm sau Phase 6). |
+| 6 (live) | ✅ Xong | L0–L11 PASS; xác định **Case B** → tạo `api/signatureShim.js` (12 test unit mới) + export `makeToolCallId`/`parseToolCallId` từ `api/translate.js`; 6.4 flip default `openai_compat` + xác nhận bằng L0–L4 không env. Ngân sách 28 request (đã có phê duyệt vượt §2.3 cho attempt). |
+| 7 (docs) | ✅ Xong | `README.md` (§Cấu hình/§Endpoint/§Các mode/§Test/§Tài liệu khác), `AGENTS.md` §2/§3/§4/§6.7, `gemini-proxy-plan.md` §2/§3/§4.5/§6/§8, `docs/openai-compat-spike.md`, plan này. `.gitignore` không đổi. |
 
 ---
 

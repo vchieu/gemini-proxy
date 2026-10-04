@@ -159,7 +159,7 @@ describe('fallback 5xx non-stream với geminiClient THẬT (mock fetch)', () =>
     };
     const result = await handleRequest(
       { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
-      { models, keys, stateStore: store, geminiClient, config: { max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }
+      { models, keys, stateStore: store, geminiClient, config: { upstream_mode: 'translate', max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }
     );
     assert.deepEqual(calledModels, ['model-a', 'model-b']);
     assert.equal(result.usedModel, 'model-b');

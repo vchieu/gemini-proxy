@@ -57,7 +57,7 @@ describe('inflight reservation (edge case #3: concurrent requests)', () => {
     };
     const deps = {
       models, keys, stateStore: store, geminiClient: fakeClient,
-      config: { max_fallback_attempts: 2, request_timeout_ms: 5000, default_cooldown_seconds: 30 },
+      config: { upstream_mode: 'translate', max_fallback_attempts: 2, request_timeout_ms: 5000, default_cooldown_seconds: 30 },
     };
     const req = () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, deps);
     const results = await Promise.allSettled([req(), req(), req()]);

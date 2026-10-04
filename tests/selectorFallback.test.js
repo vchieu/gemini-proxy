@@ -71,7 +71,7 @@ describe('fallbackLoop integration (mock 429 -> fallback)', () => {
     };
     const result = await handleRequest(
       { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
-      { models, keys, stateStore: store, geminiClient: fakeClient, config: { max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }
+      { models, keys, stateStore: store, geminiClient: fakeClient, config: { upstream_mode: 'translate', max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }
     );
     assert.equal(result.usedModel, 'gemini-2.5-flash-lite');
     assert.equal(result.openAiResponse.choices[0].message.content, 'hello');
@@ -88,7 +88,7 @@ describe('fallbackLoop integration (mock 429 -> fallback)', () => {
     for (const m of models) for (const k of keys) store.setCooldown(k.id, m.name, now + 20000);
     const fakeClient = { callGemini: async () => { throw new Error('should not be called'); } };
     await assert.rejects(
-      () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, { models, keys, stateStore: store, geminiClient: fakeClient, config: { max_fallback_attempts: 4, default_cooldown_seconds: 30 } }),
+      () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, { models, keys, stateStore: store, geminiClient: fakeClient, config: { upstream_mode: 'translate', max_fallback_attempts: 4, default_cooldown_seconds: 30 } }),
       (e) => e.status === 429
     );
   });
@@ -115,7 +115,7 @@ describe('fallbackLoop integration (transient upstream 5xx -> fallback)', () => 
     };
     const result = await handleRequest(
       { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
-      { models, keys, stateStore: store, geminiClient: fakeClient, config: { max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }
+      { models, keys, stateStore: store, geminiClient: fakeClient, config: { upstream_mode: 'translate', max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }
     );
     assert.equal(result.usedModel, 'gemini-2.5-flash-lite');
     assert.equal(result.openAiResponse.choices[0].message.content, 'hello');
@@ -131,7 +131,7 @@ describe('fallbackLoop integration (transient upstream 5xx -> fallback)', () => 
     const keys = makeKeys();
     const fakeClient = { callGemini: async () => { throw new GeminiError('Gemini error 503: overloaded', { status: 503 }); } };
     await assert.rejects(
-      () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, { models, keys, stateStore: store, geminiClient: fakeClient, config: { max_fallback_attempts: 6, default_cooldown_seconds: 30 } }),
+      () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, { models, keys, stateStore: store, geminiClient: fakeClient, config: { upstream_mode: 'translate', max_fallback_attempts: 6, default_cooldown_seconds: 30 } }),
       (e) => e.status === 503 && /Gemini error 503/.test(e.message)
     );
   });
@@ -148,7 +148,7 @@ describe('fallbackLoop integration (transient upstream 5xx -> fallback)', () => 
       },
     };
     await assert.rejects(
-      () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, { models, keys, stateStore: store, geminiClient: fakeClient, config: { max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }),
+      () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, { models, keys, stateStore: store, geminiClient: fakeClient, config: { upstream_mode: 'translate', max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }),
       (e) => e.status === 504
     );
     assert.equal(calls, 1); // không thử cặp khác

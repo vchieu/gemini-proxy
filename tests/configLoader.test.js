@@ -31,19 +31,19 @@ describe('config/loader upstream_mode', () => {
     else process.env.UPSTREAM_MODE = originalUpstreamMode;
   });
 
-  it('defaults to translate when upstream_mode absent', () => {
+  it('defaults to openai_compat when upstream_mode absent', () => {
     const dir = makeTmpConfig({});
     try {
-      assert.equal(loadConfig(dir).settings.upstream_mode, 'translate');
+      assert.equal(loadConfig(dir).settings.upstream_mode, 'openai_compat');
     } finally {
       rmTmp(dir);
     }
   });
 
-  it('accepts upstream_mode: openai_compat', () => {
-    const dir = makeTmpConfig({ upstream_mode: 'openai_compat' });
+  it('accepts upstream_mode: translate (legacy)', () => {
+    const dir = makeTmpConfig({ upstream_mode: 'translate' });
     try {
-      assert.equal(loadConfig(dir).settings.upstream_mode, 'openai_compat');
+      assert.equal(loadConfig(dir).settings.upstream_mode, 'translate');
     } finally {
       rmTmp(dir);
     }

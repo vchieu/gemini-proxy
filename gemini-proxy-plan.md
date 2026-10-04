@@ -44,7 +44,7 @@ agent → POST /v1/chat/completions (stream: true)
 | Module | File | Export chính / signature |
 |---|---|---|
 | Bootstrap | `index.js` | `main()` — load config → `StateStore` → `createServer` → `listen` + shutdown handler |
-| Config Loader | `config/loader.js` | `loadConfig(configDir) → { keys, models, settings }`; `settings.upstream_mode` ∈ `{translate, openai_compat}` (mặc định `translate`), env `UPSTREAM_MODE` override |
+| Config Loader | `config/loader.js` | `loadConfig(configDir) → { keys, models, settings }`; `settings.upstream_mode` ∈ `{translate, openai_compat}` (**mặc định `openai_compat`** — đã flip trong Phase 6.4), env `UPSTREAM_MODE` override |
 | State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()` (atomic write qua .tmp + rename; lược bỏ inflight — transient), `reserve(k,m,est)`, `release(k,m,est)`, `resetDailyIfNeeded(k,m,now)`, `minCooldownRemaining(now)`, `snapshot()`, `flush()` (huỷ debounce + persist, dùng khi SIGINT/SIGTERM) |
 | Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` (THUẦN, không mutate pairState; cộng `inflight_count`/`inflight_tokens` vào RPD/RPM/TPM — edge case #3). Reset daily_count gọi riêng qua `StateStore.resetDailyIfNeeded(k,m,now)` |
 | Selector | `router/selector.js` | `selectPair(..., strategy?)` (thuần, không side-effect; `strategy: 'round_robin_key_then_model' \| 'priority_model_first'`) + `selectAndReserve(..., strategy?)` (select + `reserve` nguyên tử, caller BẮT BUỘC `release` mọi nhánh kết thúc) → `SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
@@ -54,7 +54,8 @@ agent → POST /v1/chat/completions (stream: true)
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
 | API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app`; mount router Gemini-native tại `/v1beta` — route `POST /v1beta/models/:modelAction`, `GET /v1beta/models`; **rẽ nhánh `upstream_mode`**: `translate` → `handleRequest` + defer thoughtSignature, `openai_compat` → `streamOpenAiPassthrough` (stream) / `handleRequest` bỏ qua `translate` (non-stream); che `key=` trong access log |
 | OpenAI Passthrough | `api/openaiPassthrough.js` | `streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi })` — stream SSE ở mức event cho `upstream_mode=openai_compat`: gom event `data:` đúng spec, forward payload **gốc** (không parse→stringify lại), lọc chunk usage-only `choices:[]` khi agent không xin `stream_options.include_usage`, tự ghi `[DONE]` nếu upstream thiếu; mọi nhánh `release()` đúng 1 lần + luôn `res.end()`; client ngắt → `reader.cancel()`, không `recordSuccess`, không `[DONE]`; không `require` `api/server.js` (tránh vòng) |
-| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, modelName, streamId, created, toolCallIndexOffset?)`; tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse`; **legacy — chỉ dùng khi `upstream_mode=translate`** |
+| OpenAI Signature Shim | `api/signatureShim.js` | `responseToClient(openAiResponse)`, `requestToUpstream(agentRequest)`, `chunkToClient(chunk, state) → { chunk, changed, unshimmed }`, `readThoughtSignature(tc)`; **chỉ dùng khi `upstream_mode=openai_compat` — kết quả xác định được Case B** (xem `docs/openai-compat-spike.md` Q1/Q2); round-trip `tool_calls[].extra_content.google.thought_signature` ↔ `tool_calls[].id` `callsig_…`; tái dùng `makeToolCallId`/`parseToolCallId`; không `require` `api/server.js` |
+| Translate | `api/translate.js` | `openAiToGemini(oaiBody)`, `geminiToOpenAi(gemBody, modelName?)`, `geminiChunkToOpenAiChunk(chunk, modelName, streamId, created, toolCallIndexOffset?)`; tool/function-calling: `tools` → `functionDeclarations`, `tool_choice` → `toolConfig`, `tool_calls` → `functionCall`, `role: "tool"` → `functionResponse`; export thêm `attachThoughtSignature(id, sig)`, **`makeToolCallId(name, sig)`**, **`parseToolCallId(id)`** (định nghĩa duy nhất format `callsig_…`); **legacy — chỉ dùng khi `upstream_mode=translate`** |
 | Token estimate | `utils/tokenEstimate.js` | `estimateTokens(messages) → number` (heuristic chars/4 + 4 token overhead/message) |
 | Time | `utils/time.js` | `nextMidnightPacific(nowMs) → ms` |
 | Logger | `utils/logger.js` | `logger.{debug,info,warn,error}`, `createLogger(level)` |
@@ -164,8 +165,15 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 - **OpenAI-compatible mode (`upstream_mode=openai_compat`):** bypass `translate` entirely.
   Body forwarded directly to Google's `POST /v1beta/openai/chat/completions` with
   `Authorization: Bearer <key>`. Model field overridden with selected pair's model name.
-  Field `OPENAI_DROP_FIELDS` (mặc định rỗng) có thể định nghĩa các field cần xoá trước khi
-  forward. Sử dụng `callOpenAI`/`callOpenAIStream` từ `client/geminiClient.js`.
+  Field `OPENAI_DROP_FIELDS` (mặc định rỗng — spike Q6 không phát hiện field nào bị từ chối)
+  có thể định义 các field cần xoá trước khi forward. Sử dụng `callOpenAI`/`callOpenAIStream`
+  từ `client/geminiClient.js`.
+  **thoughtSignature (Case B — đã xác minh live, xem `docs/openai-compat-spike.md`):**
+  Google trả `tool_calls[].extra_content.google.thought_signature`; client OpenAI chuẩn
+  KHÔNG echo field lạ này → replay history bị 400 `Function call is missing a
+  thought_signature`. `api/signatureShim.js` nhúng sig vào `tool_call_id` dạng `callsig_…`
+  khi trả client (`responseToClient` / `chunkToClient`) và dựng lại `extra_content` khi
+  nhận history (`requestToUpstream`).
 
 ## 5. Edge cases
 
@@ -224,14 +232,15 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
   "max_fallback_attempts": 12,
   "respect_agent_model": false,
   "default_cooldown_seconds": 30,
-  "upstream_mode": "translate"
+  "upstream_mode": "openai_compat"
 }
 ```
 
 `upstream_mode`:
-- `"translate"` (mặc định) — dịch format OpenAI ↔ Gemini native qua `api/translate.js`.
-- `"openai_compat"` — passthrough body OpenAI gốc tới endpoint OpenAI-compat của Google
-  `/v1beta/openai/chat/completions` (dùng `callOpenAI`/`callOpenAIStream`), bỏ qua `api/translate.js`.
+- `"openai_compat"` (**mặc định** kể từ Phase 6.4) — passthrough body OpenAI gốc tới endpoint
+  OpenAI-compat của Google `/v1beta/openai/chat/completions` (dùng `callOpenAI`/`callOpenAIStream`),
+  bỏ qua `api/translate.js`.
+- `"translate"` — legacy: dịch format OpenAI ↔ Gemini native qua `api/translate.js`.
 - Override bằng biến môi trường `UPSTREAM_MODE` (ưu tiên hơn config file); giá trị ngoài
   2 giá trị trên → `loadConfig` ném lỗi.
 
@@ -252,4 +261,4 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 npm test
 ```
 
-Kỳ vọng: **106/106 pass** (2026-10-04; 2026-10-02 gồm tool/function-calling tests, 2026-10-03 thêm 6 test native router, 2026-10-04 thêm 12 test `geminiClient` error handling với `Response` thật, cùng ngày thêm 36 test cho nhánh `upstream_mode=openai_compat`: `configLoader`, `openaiClient`, `openaiFallback`, `openaiStreaming`).
+Kỳ vọng: **118/118 pass** (2026-10-04; 2026-10-02 gồm tool/function-calling tests, 2026-10-03 thêm 6 test native router, 2026-10-04 thêm 12 test `geminiClient` error handling với `Response` thật, cùng ngày thêm 36 test cho nhánh `upstream_mode=openai_compat` (`configLoader`, `openaiClient`, `openaiFallback`, `openaiStreaming`) và 12 test `api/signatureShim.js`).

@@ -55,7 +55,7 @@ describe('streaming route (ReadableStream body)', () => {
       callGeminiStream: async () => ({ body: makeSSEBody(sseData) }),
     };
 
-    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
     const server = app.listen(0);
     await new Promise((r) => server.once('listening', r));
     const port = server.address().port;
@@ -95,7 +95,7 @@ describe('streaming route (ReadableStream body)', () => {
       callGeminiStream: async () => ({ body: makeReadableStream([p1, p2, p3]) }),
     };
 
-    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
     const server = app.listen(0);
     await new Promise((r) => server.once('listening', r));
     const port = server.address().port;
@@ -133,7 +133,7 @@ describe('streaming route (ReadableStream body)', () => {
       callGeminiStream: async () => ({ body: makeReadableStream([sse]) }),
     };
 
-    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
     const server = app.listen(0);
     await new Promise((r) => server.once('listening', r));
     const port = server.address().port;
@@ -168,7 +168,7 @@ describe('streaming route (ReadableStream body)', () => {
       callGeminiStream: async () => ({ body: errorStream }),
     };
 
-    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
     const server = app.listen(0);
     await new Promise((r) => server.once('listening', r));
     const port = server.address().port;
@@ -199,7 +199,7 @@ describe('streaming route (ReadableStream body)', () => {
         return { body: makeSSEBody(sse) };
       },
     };
-    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
     const server = app.listen(0);
     await new Promise((r) => server.once('listening', r));
     try {
@@ -229,7 +229,7 @@ describe('streaming route (ReadableStream body)', () => {
       cancel() { cancelled = true; },
     });
     const fakeClient = { callGeminiStream: async () => ({ body: infinite }) };
-    const app = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeClient });
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
     const server = app.listen(0);
     await new Promise((r) => server.once('listening', r));
     const port = server.address().port;
@@ -259,7 +259,7 @@ describe('streaming route (ReadableStream body)', () => {
     const st = store.get('key-1', 'm');
     st.request_timestamps = [now - 1000];
 
-    const app = createServer({ models, keys, stateStore: store, config: {} });
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' } });
     const server = app.listen(0);
     await new Promise((r) => server.once('listening', r));
     const port = server.address().port;

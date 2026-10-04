@@ -458,4 +458,13 @@ function geminiChunkToOpenAiChunk(geminiChunk, modelName, streamId, created, too
   };
 }
 
-module.exports = { openAiToGemini, geminiToOpenAi, geminiChunkToOpenAiChunk, attachThoughtSignature };
+module.exports = {
+  openAiToGemini,
+  geminiToOpenAi,
+  geminiChunkToOpenAiChunk,
+  attachThoughtSignature,
+  // Dùng chung format id `callsig_<name>_<rand>_<sig>` với api/signatureShim.js
+  // (upstream_mode=openai_compat) — chỉ có 1 nơi định nghĩa format này.
+  makeToolCallId,
+  parseToolCallId,
+};

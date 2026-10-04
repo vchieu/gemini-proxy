@@ -21,6 +21,9 @@ function sendError(res, e, config) {
 function createServer({ models, keys, stateStore, config, geminiClient }) {
   const client = geminiClient || require('../client/geminiClient');
   const deps = { models, keys, stateStore, geminiClient: client, config };
+  // Mặc định openai_compat (khớp config/loader.js); `config:{}` trong test vẫn
+  // đi nhánh này — test nào muốn luyện nhánh legacy phải ghi rõ upstream_mode.
+  const upstreamMode = (config && config.upstream_mode) || 'openai_compat';
   const app = express();
 
   // Access log: method, path, status, duration. /health poll mỗi giây -> debug để không spam log.
@@ -81,7 +84,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         });
       }
     }
-    res.json({ now, strategy: config.strategy, upstream_mode: (config && config.upstream_mode) || 'translate', pairs });
+    res.json({ now, strategy: config.strategy, upstream_mode: upstreamMode, pairs });
   });
 
   // Mount Gemini-native router at /v1beta
@@ -101,10 +104,11 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     if (agentRequest.stream !== true) {
       try {
         const result = await handleRequest(agentRequest, deps);
-        // tool_call không có thoughtSignature -> id ở format cũ, replay history Gemini 3 sẽ 400
-        // (chỉ áp dụng khi translate: openai_compat pass nguyên response Google, không qua makeToolCallId)
+        // tool_call không có thoughtSignature -> id ở format cũ, replay history Gemini 3 sẽ 400.
+        // Hai mode đều nhúng sig vào id (translate: geminiToOpenAi; openai_compat: signatureShim)
+        // nên điều kiện chỉ cần là "id không bắt đầu bằng callsig_".
         const tcs = result.openAiResponse?.choices?.[0]?.message?.tool_calls;
-        if (config.upstream_mode !== 'openai_compat' && Array.isArray(tcs)) {
+        if (Array.isArray(tcs)) {
           const bad = tcs.filter((t) => !String(t.id || '').startsWith('callsig_'));
           if (bad.length > 0) {
             logger.warn(`Response có ${bad.length} tool_call KHÔNG kèm thoughtSignature — replay history sẽ 400 với Gemini 3`, {
@@ -133,7 +137,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
 
     // openai_compat: passthrough SSE ở mức event (không defer thoughtSignature —
     // signature do Google endpoint tự lo, xem PLAN-openai-compat-migration.md Phase 4)
-    if (config.upstream_mode === 'openai_compat') {
+    if (upstreamMode === 'openai_compat') {
       return streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi });
     }
 

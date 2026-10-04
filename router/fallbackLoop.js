@@ -3,6 +3,7 @@ const { extractRetryDelaySeconds, DEFAULT_COOLDOWN_SECONDS } = require('../clien
 const { Gemini429Error } = require('../client/geminiClient');
 const { estimateTokens } = require('../utils/tokenEstimate');
 const { openAiToGemini, geminiToOpenAi } = require('../api/translate');
+const signatureShim = require('../api/signatureShim');
 const { logger } = require('../utils/logger');
 
 class Aggregated429Error extends Error {
@@ -63,7 +64,7 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   const maxAttempts = (config && config.max_fallback_attempts) || 12;
   const defaultCooldown = (config && config.default_cooldown_seconds) || DEFAULT_COOLDOWN_SECONDS;
   const timeoutMs = (config && config.request_timeout_ms) || 60000;
-  const mode = (config && config.upstream_mode) || 'translate';
+  const mode = (config && config.upstream_mode) || 'openai_compat';
 
   let candidateModels = models;
   const requestedModel = agentRequest && agentRequest.model;
@@ -109,7 +110,9 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
     logger.info(`Attempt ${attempts + 1}: trying key=${pair.key.id} model=${pair.model.name}`);
     try {
       const ctx = { geminiBody, estimated, timeoutMs };
-      if (mode === 'openai_compat') ctx.openAiBody = agentRequest;
+      // Case B (xem api/signatureShim.js): dựng lại extra_content từ callsig_… trong id
+      // trước khi gửi lên Google, nếu không replay history sẽ bị 400 missing signature.
+      if (mode === 'openai_compat') ctx.openAiBody = signatureShim.requestToUpstream(agentRequest);
       const value = await call(pair, ctx);
       return { value, pair, estimated, attempts: attempts + 1 };
     } catch (e) {
@@ -151,7 +154,7 @@ async function handleRequest(agentRequest, deps) {
       return geminiClient.callGemini(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
     }
   );
-  const upstreamMode = deps && deps.config && deps.config.upstream_mode || 'translate';
+  const upstreamMode = (deps && deps.config && deps.config.upstream_mode) || 'openai_compat';
   const totalTokens = upstreamMode === 'openai_compat'
     ? geminiRes.usage && geminiRes.usage.total_tokens
     : (geminiRes.usageMetadata || {}).totalTokenCount || estimated;
@@ -159,7 +162,7 @@ async function handleRequest(agentRequest, deps) {
   stateStore.release(pair.key.id, pair.model.name, estimated);
   stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
   const openAiResponse = upstreamMode === 'openai_compat'
-    ? geminiRes
+    ? signatureShim.responseToClient(geminiRes)
     : geminiToOpenAi(geminiRes, pair.model.name);
   logger.info(`Success with key=${pair.key.id} model=${pair.model.name}`, { tokens: totalTokens });
   return { openAiResponse, usedKeyId: pair.key.id, usedModel: pair.model.name, attempts };

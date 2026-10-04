@@ -1,4 +1,5 @@
 const { logger } = require('../utils/logger');
+const { chunkToClient } = require('./signatureShim');
 
 /**
  * Stream passthrough SSE cho `upstream_mode=openai_compat` (xem plan
@@ -44,6 +45,7 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
   let clientAborted = false;
   let sawDone = false;
   let totalTokens = estimated;
+  const shimState = { names: {} }; // tên function đã thấy theo index (dùng cho shim signature)
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -96,8 +98,15 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
     // Chunk usage-only (choices: []) → lọc nếu agent không xin usage
     const isUsageOnly = Array.isArray(parsed && parsed.choices) && parsed.choices.length === 0;
     if (isUsageOnly && !includeUsage) return;
-    // Payload gốc, KHÔNG JSON.stringify lại
-    res.write(`data: ${payloadRaw}\n\n`);
+    // Case B: nhúng thoughtSignature vào tool_call id (client không echo extra_content).
+    // Chỉ re-stringify khi THẬT SỰ có gì đó đổi — còn lại giữ nguyên payload gốc.
+    const shim = chunkToClient(parsed, shimState);
+    if (shim.unshimmed) {
+      logger.warn('openai_passthrough: không gắn được thoughtSignature vào tool_call id (thiếu tên function) — replay history có thể 400', {
+        model: pair.model.name,
+      });
+    }
+    res.write(`data: ${shim.changed ? JSON.stringify(shim.chunk) : payloadRaw}\n\n`);
   };
 
   // Đọc loop → tách dòng → gom event → forward

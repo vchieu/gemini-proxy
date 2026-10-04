@@ -7,5 +7,5 @@
   "max_fallback_attempts": 12,
   "respect_agent_model": false,
   "default_cooldown_seconds": 30,
-  "upstream_mode": "translate"
+  "upstream_mode": "openai_compat"
 }
