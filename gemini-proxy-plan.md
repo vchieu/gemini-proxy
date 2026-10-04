@@ -231,4 +231,4 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
 npm test
 ```
 
-Kỳ vọng: **43/43 pass** (2026-10-02, gồm tool/function-calling tests — bổ sung parallel tool_calls + streaming tool_calls index).
+Kỳ vọng: **70/70 pass** (2026-10-04; 2026-10-02 gồm tool/function-calling tests, 2026-10-03 thêm 6 test native router, 2026-10-04 thêm 12 test `geminiClient` error handling với `Response` thật).

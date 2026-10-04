@@ -30,6 +30,44 @@ function buildUrl(model, apiKey, stream) {
   );
 }
 
+const QUOTA_RE = /quota|rate|limit|retry/i;
+
+/**
+ * Dựng lỗi từ 1 HTTP response KHÔNG ok, dựa trên `text` ĐÃ ĐỌC (body chỉ được
+ * đọc đúng 1 lần ở caller — đọc lần 2 trên Response sẽ ném TypeError "Body is unusable").
+ * - 429, hoặc 403 kèm message quota/rate/limit/retry -> Gemini429Error (có retryDelaySeconds)
+ * - còn lại -> GeminiError `Gemini error <status>: <text>` (prefix này được
+ *   fallbackLoop.isTransientUpstream dùng để nhận diện 5xx upstream) + `.body` là
+ *   JSON Google đã parse (undefined nếu body không phải JSON object).
+ * @param {number} status
+ * @param {string} text
+ * @returns {Gemini429Error | GeminiError}
+ */
+function buildHttpError(status, text) {
+  let parsed;
+  try { parsed = text ? JSON.parse(text) : undefined; } catch (_) { parsed = undefined; }
+  const isObj = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
+  const errObj = isObj && parsed.error && typeof parsed.error === 'object' ? parsed.error : undefined;
+  const msg = (errObj && errObj.message) || text || `HTTP ${status}`;
+
+  // Gemini đôi khi trả 403 kèm quota message — coi như 429
+  if (status === 429 || (status === 403 && QUOTA_RE.test(msg))) {
+    const retryDelaySeconds = extractRetryDelaySeconds(
+      errObj ? parsed : { error: { message: msg, details: undefined } }
+    );
+    return new Gemini429Error(msg, {
+      rawMessage: msg,
+      details: errObj ? errObj.details : undefined,
+      retryDelaySeconds,
+      status: 429,
+    });
+  }
+  return new GeminiError(`Gemini error ${status}: ${text}`, {
+    status,
+    body: isObj ? parsed : undefined,
+  });
+}
+
 /**
  * Gọi Gemini generateContent API với 1 key + model cụ thể.
  * @param {ApiKeyConfig} key
@@ -38,6 +76,7 @@ function buildUrl(model, apiKey, stream) {
  * @param {{timeoutMs?: number}} options
  * @returns {Promise<object>}  // response Gemini gốc, có usageMetadata
  * @throws {Gemini429Error} khi bị rate limit — error object cần có `.rawMessage` và `.details`
+ * @throws {GeminiError} lỗi HTTP khác (`.status`, `.body` = JSON Google nếu parse được)
  */
 async function callGemini(key, model, geminiRequestBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
@@ -51,7 +90,7 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
       body: JSON.stringify(geminiRequestBody),
       signal: controller.signal,
     });
-    text = await res.text(); // timeout phủ cả lúc đọc body (#5)
+    text = await res.text(); // đọc body ĐÚNG 1 LẦN; timeout phủ cả lúc đọc body (#5)
   } catch (e) {
     if (e.name === 'AbortError') throw new GeminiError(`Gemini request timeout after ${timeoutMs}ms`, { status: 504 });
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
@@ -59,29 +98,10 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
     clearTimeout(timer);
   }
 
+  if (!res.ok) throw buildHttpError(res.status, text);
+
   let body;
   try { body = text ? JSON.parse(text) : {}; } catch (_) { body = { raw: text }; }
-
-  if (res.status === 429 || res.status === 403) {
-    // Gemini đôi khi trả 403 kèm quota message — coi như 429 nếu có retry info
-    const msg = body?.error?.message || text || `HTTP ${res.status}`;
-    const retryDelaySeconds = extractRetryDelaySeconds(body?.error ? body : { error: { message: msg, details: body?.error?.details } });
-    const isQuota = /quota|rate|limit|retry/i.test(msg);
-    if (res.status === 429 || isQuota) {
-      throw new Gemini429Error(msg, {
-        rawMessage: msg,
-        details: body?.error?.details,
-        retryDelaySeconds,
-        status: 429,
-      });
-    }
-  }
-  if (!res.ok) {
-    clearTimeout(timer);
-    const text = await res.text();
-    let parsed; try { parsed = JSON.parse(text); } catch (_) { parsed = undefined; }
-    throw new GeminiError(`Gemini error ${res.status}: ${text}`, { status: res.status, body: parsed });
-  }
   return body;
 }
 
@@ -111,26 +131,20 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
   }
 
-  if (res.status === 429 || res.status === 403) {
-    clearTimeout(timer);
-    const text = await res.text();
-    let body;
-    try { body = JSON.parse(text); } catch (_) { body = { error: { message: text } }; }
-    const msg = body?.error?.message || text;
-    const isQuota = /quota|rate|limit|retry/i.test(msg);
-    if (res.status === 429 || isQuota) {
-      throw new Gemini429Error(msg, {
-        rawMessage: msg,
-        details: body?.error?.details,
-        retryDelaySeconds: extractRetryDelaySeconds(body?.error ? body : { error: { message: msg, details: body?.error?.details } }),
-        status: 429,
-      });
-    }
-  }
   if (!res.ok) {
+    // Đọc body ĐÚNG 1 LẦN rồi giao cho buildHttpError (429/403-quota -> Gemini429Error, còn lại GeminiError).
+    let text = '';
+    try {
+      text = await res.text();
+    } catch (e) {
+      if (timedOut || e.name === 'AbortError') {
+        clearTimeout(timer);
+        throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
+      }
+      logger.warn(`Cannot read error body (HTTP ${res.status}): ${e.message}`);
+    }
     clearTimeout(timer);
-    const text = await res.text();
-    throw new GeminiError(`Gemini error ${res.status}: ${text}`, { status: res.status });
+    throw buildHttpError(res.status, text);
   }
 
   // KHÔNG gán res.body (Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng).
