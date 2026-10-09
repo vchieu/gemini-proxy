@@ -23,7 +23,9 @@ const OPENAI_OK = {
 };
 
 function makeDeps(extra = {}) {
-  const stateStore = new StateStore(null);
+  // extra.store phải được DÙNG thật — nếu tạo store mới ở đây, các test M2
+  // sẽ assert vào 1 store khác với store mà handleRequest đang ghi -> test mất tác dụng.
+  const stateStore = extra.store || new StateStore(null);
   return {
     stateStore,
     models: MODELS,
@@ -273,5 +275,56 @@ describe('fallbackLoop upstream_mode=openai_compat', () => {
     assert.equal(st.inflight_count, 0);
     assert.equal(st.inflight_tokens, 0);
     assert.equal(st.daily_count, 0, 'openStream never records success');
+  });
+
+  it('does NOT leak reservation when upstream returns null body (M2)', async () => {
+    const store = new StateStore(null);
+    const deps = makeDeps({ store, client: {
+      callOpenAI: async () => null,
+    } });
+    const res = await handleRequest(req, deps);
+    assert.equal(res.openAiResponse, null);
+    const st = store.get('key-1', 'a');
+    assert.equal(st.inflight_count, 0, 'reservation must be released on null response body');
+  });
+
+  it('does NOT leak reservation when response processing throws (M2)', async () => {
+    const store = new StateStore(null);
+    const deps = makeDeps({ store, client: {
+      callOpenAI: async () => {
+        return {
+          get usage() { throw new Error('corrupted usage'); }
+        };
+      },
+    } });
+    await assert.rejects(
+      () => handleRequest(req, deps),
+      /corrupted usage/
+    );
+    const st = store.get('key-1', 'a');
+    assert.equal(st.inflight_count, 0, 'reservation must be released even on throw');
+  });
+
+  it('estimate includes tools schema on the production path (L2)', async () => {
+    // Regression: withFallback từng truyền messages[] -> estimateTokens rơi vào nhánh mảng,
+    // không bao giờ đếm tools schema (phần code cộng tools nằm ở nhánh object, không với tới).
+    const agentRequest = {
+      model: 'auto',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'do_thing', description: 'x'.repeat(4000), parameters: { type: 'object', properties: {} } } }],
+    };
+    let observedInflightTokens = -1;
+    const deps = makeDeps({ client: {
+      callOpenAI: async () => {
+        observedInflightTokens = deps.stateStore.get('key-1', 'a').inflight_tokens;
+        return OPENAI_OK;
+      },
+    } });
+
+    await handleRequest(agentRequest, deps);
+
+    const messagesOnly = estimateTokens(agentRequest.messages);
+    assert.ok(observedInflightTokens > messagesOnly,
+      `tools schema must be counted: inflight=${observedInflightTokens} vs messagesOnly=${messagesOnly}`);
   });
 });

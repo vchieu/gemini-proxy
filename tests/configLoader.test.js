@@ -74,6 +74,16 @@ describe('config/loader upstream_mode', () => {
       process.env.UPSTREAM_MODE = 'bogus';
       assert.throws(() => loadConfig(dir), /upstream_mode must be one of/);
     } finally {
+      delete process.env.UPSTREAM_MODE;
+      rmTmp(dir);
+    }
+  });
+
+  it('throws when default_cooldown_seconds is negative or non-number (L3)', () => {
+    const dir = makeTmpConfig({ default_cooldown_seconds: -5 });
+    try {
+      assert.throws(() => loadConfig(dir), /default_cooldown_seconds must be a non-negative number/);
+    } finally {
       rmTmp(dir);
     }
   });

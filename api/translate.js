@@ -114,7 +114,10 @@ function openAiToGemini(openAiRequestBody) {
       const text = Array.isArray(m.content)
         ? m.content.map((p) => (typeof p === 'string' ? p : p.text || '')).join('')
         : String(m.content ?? '');
-      systemInstruction = { parts: [{ text }] };
+      if (!systemInstruction) {
+        systemInstruction = { parts: [] };
+      }
+      systemInstruction.parts.push({ text });
     } else if (role === 'assistant') {
       // Assistant message có thể chứa tool_calls
       let parts = normalizeContent(m.content);

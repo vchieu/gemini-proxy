@@ -35,7 +35,9 @@ function estimateTokens(messages) {
 
   // OpenAI request body
   if (!Array.isArray(messages) && typeof messages === 'object' && messages.messages) {
-    return estimateTokens(messages.messages);
+    let extra = 0;
+    if (messages.tools) extra += countTextTokens(JSON.stringify(messages.tools));
+    return estimateTokens(messages.messages) + extra;
   }
   // Gemini request body
   if (!Array.isArray(messages) && typeof messages === 'object' && messages.contents) {
@@ -52,7 +54,10 @@ function estimateTokens(messages) {
     let total = 0;
     for (const m of messages) {
       if (typeof m === 'string') total += countTextTokens(m);
-      else if (m && typeof m === 'object') total += countTextTokens(contentToText(m.content));
+      else if (m && typeof m === 'object') {
+        total += countTextTokens(contentToText(m.content));
+        if (m.tool_calls) total += countTextTokens(JSON.stringify(m.tool_calls));
+      }
       // cộng thêm overhead nhỏ cho role/metadata (theo kinh nghiệm OpenAI ~4 token/message)
       total += 4;
     }

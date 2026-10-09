@@ -96,6 +96,9 @@ function loadConfig(configDir) {
   if (typeof settings.max_fallback_attempts !== 'number' || !(settings.max_fallback_attempts >= 1)) {
     throw new Error('config.json: max_fallback_attempts must be >= 1');
   }
+  if (typeof settings.default_cooldown_seconds !== 'number' || !(settings.default_cooldown_seconds >= 0)) {
+    throw new Error('config.json: default_cooldown_seconds must be a non-negative number');
+  }
 
   return { keys, models, settings };
 }

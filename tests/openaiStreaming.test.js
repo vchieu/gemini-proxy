@@ -228,6 +228,27 @@ describe('streamOpenAiPassthrough (upstream_mode=openai_compat)', () => {
     } finally { server.close(); }
   });
 
+  it('mid-stream in-band error chunk -> forwards error, NO [DONE], NO recordSuccess, releases reservation (H2)', async () => {
+    const store = new StateStore(null);
+    const inBandErr = 'data: {"error":{"code":429,"message":"Resource exhausted: quota exceeded"}}\n\n';
+    const server = await makeApp(store, {
+      callOpenAIStream: async () => ({
+        ok: true,
+        status: 200,
+        body: makeReadableStream(['data: ' + JSON.stringify(chatChunk('c1', 'partial')) + '\n\n', inBandErr]),
+      }),
+    });
+    try {
+      const res = await post(server.address().port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      assert.ok(res.body.includes('Resource exhausted'), 'error chunk must be forwarded');
+      assert.ok(!res.body.includes('[DONE]'), 'must NOT append [DONE] after error');
+      const st = store.get('key-1', 'a');
+      assert.equal(st.daily_count, 0, 'must NOT recordSuccess');
+      assert.equal(st.inflight_count, 0, 'reservation must be released');
+    } finally { server.close(); }
+  });
+
   it('client disconnect -> no recordSuccess, upstream cancelled, reservation released', async () => {
     const store = new StateStore(null);
     const enc = new TextEncoder();

@@ -73,9 +73,11 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
     if (found.length > 0) candidateModels = found;
   }
 
+  // Truyền cả body (không chỉ messages[]) để estimateTokens tính thêm JSON của `tools`
+  // — truyền messages[] sẽ rơi vào nhánh mảng và bỏ sót tools schema (L2).
   const estimated = options.geminiBody
     ? estimateTokens(options.geminiBody)
-    : estimateTokens(agentRequest && agentRequest.messages ? agentRequest.messages : agentRequest);
+    : estimateTokens(agentRequest);
   const geminiBody = options.geminiBody
     || (mode === 'openai_compat' ? undefined : openAiToGemini(agentRequest || {}));
 
@@ -96,12 +98,12 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
     // select + reserve đồng bộ, không await ở giữa (edge case #3)
     const pair = selectAndReserve(candidateModels, keys, stateStore, now, estimated, triedPairs, config && config.strategy);
     if (!pair) {
-      const waitMs = minCooldownRemainingMs(candidateModels, keys, stateStore, now);
-      if (lastTransient && waitMs === 0) {
-        // hết cặp là do đã thử tất cả và đều 5xx (không có cooldown 429 nào) -> trả lỗi 5xx gốc
+      if (lastTransient) {
+        // Có lỗi 5xx upstream trong đợt thử này -> trả lỗi 5xx gốc thay vì mask thành 429
         logger.warn(`All pairs failed with transient upstream 5xx: ${lastTransient.message}`);
         throw lastTransient;
       }
+      const waitMs = minCooldownRemainingMs(candidateModels, keys, stateStore, now);
       const retryAfter = Math.max(1, Math.ceil(waitMs / 1000));
       logger.warn('All pairs exhausted', { tried: triedPairs.length, retryAfter });
       throw new Aggregated429Error('Tất cả model/key đều đang bị giới hạn, vui lòng thử lại sau', retryAfter);
@@ -157,17 +159,25 @@ async function handleRequest(agentRequest, deps) {
   const upstreamMode = (deps && deps.config && deps.config.upstream_mode) || 'openai_compat';
   // Cả 2 mode đều fallback về `estimated` khi upstream KHÔNG trả usage — nếu không,
   // recordSuccess ghi 0 token và TPM bị đếm thiếu (đọc từ review).
-  const totalTokens = upstreamMode === 'openai_compat'
-    ? ((geminiRes.usage && geminiRes.usage.total_tokens) || estimated)
-    : ((geminiRes.usageMetadata || {}).totalTokenCount || estimated);
-  // release -> recordSuccess đồng bộ, không await ở giữa
-  stateStore.release(pair.key.id, pair.model.name, estimated);
-  stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
-  const openAiResponse = upstreamMode === 'openai_compat'
-    ? signatureShim.responseToClient(geminiRes)
-    : geminiToOpenAi(geminiRes, pair.model.name);
-  logger.info(`Success with key=${pair.key.id} model=${pair.model.name}`, { tokens: totalTokens });
-  return { openAiResponse, usedKeyId: pair.key.id, usedModel: pair.model.name, attempts };
+  let released = false;
+  try {
+    const totalTokens = upstreamMode === 'openai_compat'
+      ? ((geminiRes && geminiRes.usage && geminiRes.usage.total_tokens) || estimated)
+      : (((geminiRes && geminiRes.usageMetadata) || {}).totalTokenCount || estimated);
+    // release -> recordSuccess đồng bộ, không await ở giữa
+    stateStore.release(pair.key.id, pair.model.name, estimated);
+    released = true;
+    stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
+    const openAiResponse = upstreamMode === 'openai_compat'
+      ? signatureShim.responseToClient(geminiRes)
+      : geminiToOpenAi(geminiRes, pair.model.name);
+    logger.info(`Success with key=${pair.key.id} model=${pair.model.name}`, { tokens: totalTokens });
+    return { openAiResponse, usedKeyId: pair.key.id, usedModel: pair.model.name, attempts };
+  } finally {
+    if (!released) {
+      stateStore.release(pair.key.id, pair.model.name, estimated);
+    }
+  }
 }
 
 /**
@@ -207,10 +217,18 @@ async function handleNativeRequest(requestedModel, geminiBody, deps) {
     (p, ctx) => geminiClient.callGemini(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs }),
     { geminiBody }
   );
-  const total = (value.usageMetadata || {}).totalTokenCount || estimated;
-  stateStore.release(pair.key.id, pair.model.name, estimated);
-  stateStore.recordSuccess(pair.key.id, pair.model.name, total);
-  return { geminiResponse: value, usedKeyId: pair.key.id, usedModel: pair.model.name, attempts };
+  let released = false;
+  try {
+    const total = ((value && value.usageMetadata) || {}).totalTokenCount || estimated;
+    stateStore.release(pair.key.id, pair.model.name, estimated);
+    released = true;
+    stateStore.recordSuccess(pair.key.id, pair.model.name, total);
+    return { geminiResponse: value, usedKeyId: pair.key.id, usedModel: pair.model.name, attempts };
+  } finally {
+    if (!released) {
+      stateStore.release(pair.key.id, pair.model.name, estimated);
+    }
+  }
 }
 
 /**

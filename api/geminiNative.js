@@ -77,12 +77,20 @@ async function streamNative(req, res, requestedModel, body, deps) {
   let totalTokens = estimated;
   let clientAborted = false;
   let streamCompleted = false;
+  let streamError = null;
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-  });
+  // writeHead nằm NGOÀI try/read-loop bên dưới -> tự guard để không leak reservation (M1 còn dư)
+  try {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+  } catch (e) {
+    release();
+    if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+    return sendGeminiError(res, e, deps.config);
+  }
 
   res.on('close', () => {
     if (!res.writableEnded) {
@@ -103,13 +111,18 @@ async function streamNative(req, res, requestedModel, body, deps) {
         dataLines = [];
         try {
           const g = JSON.parse(eventText);
-          if (g.usageMetadata && g.usageMetadata.totalTokenCount) {
+          const errObj = (g && g.error) || (Array.isArray(g) && g[0] && g[0].error);
+          if (errObj) {
+            streamError = new Error(errObj.message || 'Upstream stream error');
+            streamError.status = errObj.code || 500;
+            streamError.alreadyEmitted = true;
+            logger.error(`Native stream error in chunk: ${streamError.message}`);
+          } else if (g.usageMetadata && g.usageMetadata.totalTokenCount) {
             totalTokens = g.usageMetadata.totalTokenCount;
           }
         } catch (_) {
           // không phải JSON valid, bỏ qua (không làm rối quota)
         }
-        streamCompleted = true;
       }
       return;
     }
@@ -120,7 +133,7 @@ async function streamNative(req, res, requestedModel, body, deps) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (clientAborted) { reader.cancel().catch(() => {}); break; }
+      if (clientAborted || streamError) { reader.cancel().catch(() => {}); break; }
 
       // Ghi byte nguyên bản lên response
       res.write(value);
@@ -129,29 +142,43 @@ async function streamNative(req, res, requestedModel, body, deps) {
       buffer += Buffer.from(value).toString('utf8');
       const lines = buffer.split('\n');
       buffer = lines.pop();
-      for (const line of lines) handleLine(line);
+      for (const line of lines) {
+        handleLine(line);
+        if (streamError) break;
+      }
+      if (clientAborted || streamError) break;
     }
     // Đọc còn buffer (dòng cuối không có \n)
-    if (!clientAborted && buffer.trim()) handleLine(buffer);
+    if (!clientAborted && !streamError && buffer.trim()) handleLine(buffer);
     // Xử lý event cuối thiếu dòng trống
-    if (dataLines.length > 0) {
+    if (!clientAborted && !streamError && dataLines.length > 0) {
       const eventText = dataLines.join('\n');
       try {
         const g = JSON.parse(eventText);
-        if (g.usageMetadata && g.usageMetadata.totalTokenCount) {
+        const errObj = (g && g.error) || (Array.isArray(g) && g[0] && g[0].error);
+        if (errObj) {
+          streamError = new Error(errObj.message || 'Upstream stream error');
+          streamError.status = errObj.code || 500;
+          streamError.alreadyEmitted = true;
+          logger.error(`Native stream error in chunk: ${streamError.message}`);
+        } else if (g.usageMetadata && g.usageMetadata.totalTokenCount) {
           totalTokens = g.usageMetadata.totalTokenCount;
         }
       } catch (_) {}
     }
-    streamCompleted = true;
+    streamCompleted = !clientAborted && !streamError;
   } catch (e) {
     logger.error(`Native stream read error: ${e.message}`);
-    clientAborted = true;
+    streamError = e;
   } finally {
     release();
 
-    // Chỉ recordSuccess nếu stream hoàn tất (không clientAborted)
-    if (!clientAborted && streamCompleted) {
+    if (streamError && !clientAborted) {
+      if (!streamError.alreadyEmitted && !res.writableEnded && !res.destroyed) {
+        const errPayload = { error: { code: streamError.status || 502, message: streamError.message, status: 'UNAVAILABLE' } };
+        res.write(`data: ${JSON.stringify(errPayload)}\n\n`);
+      }
+    } else if (!clientAborted && streamCompleted) {
       stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
     }
     // KHÔNG được quên res.end() — nếu không client treo vô hạn chờ kết thúc SSE

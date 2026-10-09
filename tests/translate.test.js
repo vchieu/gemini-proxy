@@ -15,6 +15,17 @@ describe('translate', () => {
     assert.equal(g.contents[0].role, 'user');
     assert.equal(g.contents[1].role, 'model');
   });
+
+  it('preserves all system messages when multiple are provided (H1)', () => {
+    const g = openAiToGemini({ messages: [
+      { role: 'system', content: 'You are A.' },
+      { role: 'system', content: 'Rule B.' },
+      { role: 'user', content: 'hi' },
+    ] });
+    assert.equal(g.systemInstruction.parts.length, 2);
+    assert.equal(g.systemInstruction.parts[0].text, 'You are A.');
+    assert.equal(g.systemInstruction.parts[1].text, 'Rule B.');
+  });
   it('maps gemini response to OpenAI', () => {
     const oai = geminiToOpenAi({
       candidates: [{ content: { parts: [{ text: 'abc' }] }, finishReason: 'STOP' }],
@@ -281,6 +292,15 @@ describe('tokenEstimate', () => {
   it('estimates chars/4', () => {
     assert.equal(estimateTokens('abcd'), 1);
     assert.ok(estimateTokens([{ role: 'user', content: 'hello world' }]) > 0);
+  });
+
+  it('counts tools schema and tool_calls history (L2)', () => {
+    const messages = [{ role: 'user', content: 'hi' }];
+    const withTools = { messages, tools: [{ type: 'function', function: { name: 'f', description: 'd'.repeat(400) } }] };
+    assert.ok(estimateTokens(withTools) >= estimateTokens(messages) + 100,
+      'tools JSON must add to the estimate');
+    const withCalls = [{ role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'f', arguments: '{}'.padEnd(400, ' ') } }] }];
+    assert.ok(estimateTokens(withCalls) >= 100, 'tool_calls JSON must add to the estimate');
   });
 });
 

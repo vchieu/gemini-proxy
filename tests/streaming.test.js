@@ -185,6 +185,35 @@ describe('streaming route (ReadableStream body)', () => {
     }
   });
 
+  it('does NOT write [DONE] or recordSuccess when stream receives in-band error chunk (H2)', async () => {
+    const store = new StateStore(null);
+    const models = [{ name: 'm', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1000000 } }];
+    const keys = [{ id: 'key-1', api_key: 'k1', enabled: true }];
+
+    const errorChunk = JSON.stringify({ error: { code: 429, message: 'Resource exhausted: quota exceeded' } });
+    const sse = `data: ${errorChunk}\n\n`;
+
+    const fakeClient = {
+      callGeminiStream: async () => ({ body: makeReadableStream([sse]) }),
+    };
+
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
+    const server = app.listen(0);
+    await new Promise((r) => server.once('listening', r));
+    const port = server.address().port;
+
+    try {
+      const res = await post(port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      assert.ok(!res.body.includes('[DONE]'), 'should NOT write [DONE] on in-band error');
+      assert.ok(res.body.includes('Resource exhausted'), 'should emit error payload');
+      const st = store.get('key-1', 'm');
+      assert.equal(st.daily_count, 0, 'should NOT count quota on error');
+    } finally {
+      server.close();
+    }
+  });
+
   it('falls back to next pair on upstream 429 before opening stream', async () => {
     const store = new StateStore(null);
     const models = [

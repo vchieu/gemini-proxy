@@ -154,4 +154,25 @@ describe('gemini-native route', () => {
     assert.ok(res.body.includes('streamed'), 'should contain upstream text');
     assert.ok(!res.body.includes('[DONE]'), 'native Gemini stream must not have [DONE]');
   });
+
+  it('case 14: native stream mid-stream error -> no recordSuccess (H2 & M3)', async () => {
+    const sse = 'data: ' + JSON.stringify({
+      error: { code: 429, message: 'Quota exceeded' },
+    }) + '\n\n';
+    const fakeStreamClient = {
+      callGeminiStream: async () => ({ body: makeReadableStream([sse]) }),
+    };
+    const localApp = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeStreamClient });
+    const localServer = localApp.listen(0);
+    await new Promise((r) => localServer.once('listening', r));
+    const localPort = localServer.address().port;
+    try {
+      const res = await postStream(localPort, {});
+      assert.equal(res.status, 200);
+      assert.ok(res.body.includes('Quota exceeded'), 'should forward error in body');
+      assert.equal(store.get('key-1', 'gemini-2.5-flash').daily_count, 0, 'should NOT count quota on error');
+    } finally {
+      localServer.close();
+    }
+  });
 });

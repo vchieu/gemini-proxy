@@ -84,7 +84,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         });
       }
     }
-    res.json({ now, strategy: config.strategy, upstream_mode: upstreamMode, pairs });
+    res.json({ now, strategy: (config && config.strategy), upstream_mode: upstreamMode, pairs });
   });
 
   // Mount Gemini-native router at /v1beta
@@ -138,7 +138,15 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     // openai_compat: passthrough SSE ở mức event (không defer thoughtSignature —
     // signature do Google endpoint tự lo, xem PLAN-openai-compat-migration.md Phase 4)
     if (upstreamMode === 'openai_compat') {
-      return streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi });
+      try {
+        await streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi });
+      } catch (err) {
+        logger.error(`streamOpenAiPassthrough unhandled error: ${err.message}`);
+        if (!res.headersSent) {
+          sendError(res, err, config);
+        }
+      }
+      return;
     }
 
     let reader;
@@ -149,11 +157,18 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       return sendError(res, e, config);
     }
 
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
+    // writeHead nằm NGOÀI vùng try lớn bên dưới -> tự guard để không leak reservation (M1 còn dư)
+    try {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      });
+    } catch (e) {
+      release();
+      if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+      return sendError(res, e, config);
+    }
 
     const streamId = `chatcmpl-${Date.now().toString(36)}`;
     const created = Math.floor(Date.now() / 1000);
@@ -240,6 +255,15 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         return;
       }
       diag.events++;
+
+      const errObj = (g && g.error) || (Array.isArray(g) && g[0] && g[0].error);
+      if (errObj) {
+        streamError = new Error(errObj.message || 'Stream error from upstream');
+        streamError.status = errObj.code || 500;
+        logger.error(`Stream error in chunk: ${streamError.message}`, { status: streamError.status });
+        return;
+      }
+
       if (g.usageMetadata && g.usageMetadata.totalTokenCount) totalTokens = g.usageMetadata.totalTokenCount;
       const parts = (g.candidates && g.candidates[0] && g.candidates[0].content && g.candidates[0].content.parts) || [];
       const orphanSigs = [];
@@ -309,31 +333,40 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (clientAborted) break;
+        if (clientAborted || streamError) {
+          reader.cancel().catch(() => {});
+          break;
+        }
         buffer += Buffer.from(value).toString('utf8');
         const lines = buffer.split('\n');
         buffer = lines.pop();
-        for (const line of lines) handleLine(line);
+        for (const line of lines) {
+          handleLine(line);
+          if (streamError) break;
+        }
+        if (clientAborted || streamError) break;
       }
-      if (!clientAborted && buffer) handleLine(buffer); // dòng cuối không có '\n'
-      if (!clientAborted && dataLines.length > 0) processEvent(dataLines.join('\n')); // event cuối thiếu dòng trống
+      if (!clientAborted && !streamError && buffer) handleLine(buffer); // dòng cuối không có '\n'
+      if (!clientAborted && !streamError && dataLines.length > 0) processEvent(dataLines.join('\n')); // event cuối thiếu dòng trống
       dataLines = [];
-      streamCompleted = !clientAborted;
+      streamCompleted = !clientAborted && !streamError;
     } catch (e) {
-      streamError = e;
+      if (!streamError) streamError = e;
       logger.error(`Stream interrupted: ${e.message}`);
+    } finally {
+      release();
+      if (streamCompleted) {
+        flushDeferred(); // xả phần trì hoãn TRƯỚC [DONE] (kể cả khi sig không đến — đã warn)
+        stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
+        if (!res.writableEnded) res.write('data: [DONE]\n\n');
+      } else if (streamError && !clientAborted) {
+        deferred.length = 0; // stream lỗi -> bỏ phần giữ lệnh, chỉ báo lỗi
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify(errorToOpenAi(streamError.status || 502, streamError.message))}\n\n`);
+        }
+      }
+      if (!res.writableEnded) res.end();
     }
-
-    release();
-    if (streamCompleted) {
-      flushDeferred(); // xả phần trì hoãn TRƯỚC [DONE] (kể cả khi sig không đến — đã warn)
-      stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);
-      res.write('data: [DONE]\n\n');
-    } else if (streamError && !clientAborted) {
-      deferred.length = 0; // stream lỗi -> bỏ phần giữ lệnh, chỉ báo lỗi
-      res.write(`data: ${JSON.stringify(errorToOpenAi(streamError.status || 502, streamError.message))}\n\n`);
-    }
-    return res.end();
   });
 
   // JSON hỏng / lỗi body-parser → trả JSON kiểu OpenAI, KHÔNG để Express default handler
