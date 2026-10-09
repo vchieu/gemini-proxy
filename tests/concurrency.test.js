@@ -81,3 +81,116 @@ describe('inflight reservation (edge case #3: concurrent requests)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('persist resilience (Windows EPERM: file bị antivirus/instance khác giữ lúc rename)', () => {
+  const eperm = (msg) => {
+    const e = new Error(msg || "EPERM: operation not permitted, rename 'x.state.json.tmp' -> 'x.state.json'");
+    e.code = 'EPERM';
+    return e;
+  };
+
+  it('retry sau rename fail 1 lần -> ghi thành công đồng bộ, không sót tmp', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-state-'));
+    const file = path.join(dir, 'state.json');
+    try {
+      const store = new StateStore(file);
+      store.get('key-1', 'm').daily_count = 7; // mutate trực tiếp để không schedule debounce timer
+      const origRename = fs.renameSync;
+      let failedOnce = false;
+      fs.renameSync = (...args) => {
+        if (!failedOnce) { failedOnce = true; throw eperm(); }
+        return origRename(...args);
+      };
+      try {
+        assert.equal(store.persist(), true, 'persist phải thành công sau retry');
+      } finally {
+        fs.renameSync = origRename;
+      }
+      assert.ok(failedOnce, 'rename fail 1 lần trước khi retry');
+      const reloaded = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(reloaded.pairs['key-1::m'].daily_count, 7);
+      assert.ok(!fs.existsSync(`${file}.${process.pid}.tmp`), 'tmp đã được rename, không sót lại');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fail đủ 3 attempt -> không ném, WARN 1 lần, tmp còn; lần persist sau self-heal', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-state-'));
+    const file = path.join(dir, 'state.json');
+    const warns = [];
+    const origWarn = console.warn;
+    const origRename = fs.renameSync;
+    let ok = false;
+    try {
+      const store = new StateStore(file);
+      store.get('key-1', 'm').daily_count = 3;
+      fs.renameSync = () => { throw eperm(); };
+      console.warn = (m) => warns.push(String(m));
+      try {
+        ok = store.persist();
+      } finally {
+        fs.renameSync = origRename;
+        console.warn = origWarn;
+        // huỷ safety-net timer để nó không bắn vào giữa các test sau
+        if (store._retryTimer) { clearTimeout(store._retryTimer); store._retryTimer = null; }
+      }
+      assert.equal(ok, false, 'persist trả false khi bỏ cuộc');
+      assert.ok(warns.some((w) => w.includes('persist failed after 3 attempts')),
+        `phải WARN đúng 1 lần về 3 attempt thất bại, got: ${JSON.stringify(warns)}`);
+      assert.ok(!fs.existsSync(file), 'state.json chưa được tạo do rename fail hết');
+      assert.ok(fs.existsSync(`${file}.${process.pid}.tmp`), 'tmp nằm lại sau khi rename fail');
+      // bỏ patch -> lần persist kế tiếp ghi lại bình thường (coi như hết lock)
+      assert.equal(store.persist(), true, 'self-heal ở lần persist kế');
+      assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).pairs['key-1::m'].daily_count === 3);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('constructor dọn tmp cũ (state.json.tmp legacy + state.json.<pid>.tmp)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-state-'));
+    const file = path.join(dir, 'state.json');
+    try {
+      fs.writeFileSync(file, JSON.stringify({ pairs: { 'k::m': { daily_count: 3 } } }));
+      const legacyTmp = `${file}.tmp`;
+      const pidTmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(legacyTmp, '{"garbage":');
+      fs.writeFileSync(pidTmp, '{"garbage":');
+      const store = new StateStore(file);
+      assert.ok(!fs.existsSync(legacyTmp), 'tmp legacy bị dọn lúc load');
+      assert.ok(!fs.existsSync(pidTmp), 'tmp theo pid bị dọn lúc load');
+      assert.equal(store.get('k', 'm').daily_count, 3, 'state.json cũ vẫn load bình thường');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('safety-net: sau khi fail đủ 3 attempt, retry tự động sau ~1s ghi được khi hết lock', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-state-'));
+    const file = path.join(dir, 'state.json');
+    const origWarn = console.warn;
+    const origRename = fs.renameSync;
+    try {
+      const store = new StateStore(file);
+      store.get('key-1', 'm').daily_count = 9;
+      fs.renameSync = () => { throw eperm(); };
+      console.warn = () => {}; // nuốt WARN dự kiến trong lúc test
+      let ok;
+      try {
+        ok = store.persist();
+      } finally {
+        fs.renameSync = origRename; // "hết lock" trước khi safety-net bắn
+        console.warn = origWarn;
+      }
+      assert.equal(ok, false);
+      assert.ok(store._retryTimer, 'safety-net timer phải được xếp');
+      await delay(1300);
+      assert.ok(fs.existsSync(file), 'safety-net retry sau 1s phải ghi thành công');
+      assert.equal(store._retryTimer, null, 'timer đã tự huỷ sau khi chạy');
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).pairs['key-1::m'].daily_count, 9);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

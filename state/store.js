@@ -2,6 +2,19 @@ const fs = require('fs');
 const path = require('path');
 const { nextMidnightPacific } = require('../utils/time');
 
+/**
+ * Sleep đồng bộ bằng Atomics.wait — chỉ dùng khi persist THẤT BẠI (file đang bị
+ * antivirus/instance khác giữ trên Windows -> EPERM/EACCES ở rename). Trường hợp
+ * hiếm gặp nên việc block event loop vài chục ms là chấp nhận được.
+ */
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (_) {
+    /* không sleep được thì bỏ qua, vẫn retry ngay */
+  }
+}
+
 function blankPairState(nowMs) {
   return {
     request_timestamps: [],
@@ -27,6 +40,8 @@ class StateStore {
     this.map = new Map();
     this._persistDelay = 500; // ms — debounce để tránh sync write mỗi request
     this._persistTimer = null;
+    this._retryTimer = null; // safety-net retry sau khi persist fail đủ 3 attempt
+    if (statePath) this._cleanupStaleTmp();
     if (statePath && fs.existsSync(statePath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
@@ -157,26 +172,78 @@ class StateStore {
     }, this._persistDelay);
   }
 
-  /** Lưu toàn bộ state ra file (JSON.stringify). Inflight bị lược bỏ vì là transient. */
-  persist() {
-    if (!this.statePath) return;
+  /**
+   * Dọn file tmp sót lại từ lần persist fail trước (Windows EPERM) hoặc process
+   * cũ chết giữa chừng. Hợp cả tên legacy `state.json.tmp` và tên theo pid
+   * `state.json.<pid>.tmp`. Best-effort: file đang bị lock thì bỏ qua.
+   */
+  _cleanupStaleTmp() {
     try {
       const dir = path.dirname(this.statePath);
-      if (dir && dir !== '.' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const pairs = {};
-      for (const [k, st] of this.map.entries()) {
-        const { inflight_count, inflight_tokens, ...durable } = st;
-        void inflight_count;
-        void inflight_tokens;
-        pairs[k] = durable;
+      const base = path.basename(this.statePath); // vd "state.json"
+      if (!fs.existsSync(dir)) return;
+      for (const f of fs.readdirSync(dir)) {
+        // "state.json.tmp" (legacy) và "state.json.<pid>.tmp" đều match;
+        // chính "state.json" thì KHÔNG (thiếu dấu '.' sau base).
+        if (!f.startsWith(`${base}.`) || !f.endsWith('.tmp')) continue;
+        try { fs.unlinkSync(path.join(dir, f)); } catch (_) { /* đang bị lock -> bỏ qua */ }
       }
-      // Atomic write: ghi vào .tmp rồi rename để tránh corruption nếu crash giữa chừng
-      const tmpPath = `${this.statePath}.tmp`;
-      fs.writeFileSync(tmpPath, JSON.stringify({ pairs }, null, 2), 'utf8');
-      fs.renameSync(tmpPath, this.statePath);
-    } catch (e) {
-      console.warn(`[StateStore] persist failed: ${e.message}`);
+    } catch (_) {
+      /* không đọc được thư mục -> bỏ qua, không được chặn khởi động */
     }
+  }
+
+  /**
+   * Lưu toàn bộ state ra file (JSON.stringify). Inflight bị lược bỏ vì là transient.
+   * @returns {boolean} true nếu đã ghi thành công
+   */
+  persist() {
+    return this._writeState(true);
+  }
+
+  /**
+   * Ghi state ra disk: tối đa 3 attempt (ghi .tmp + rename) với sleep 50/150ms
+   * giữa các lần — che cửa sổ file bị lock trên Windows (antivirus, instance thứ 2
+   * đọc đúng lúc rename -> EPERM/EACCES). Vẫn fail -> log đúng 1 lần và xếp tối đa
+   * 1 lần retry an toàn sau 1s (timer unref, không xếp chồng, không lặp vô hạn:
+   * lần retry do chính nó chạy sẽ không tự xếp tiếp).
+   * @param {boolean} mayScheduleRetry false khi chạy từ timer safety-net
+   * @returns {boolean} true nếu đã ghi xong
+   */
+  _writeState(mayScheduleRetry) {
+    if (!this.statePath) return false;
+    const tmpPath = `${this.statePath}.${process.pid}.tmp`; // theo pid: 2 process không đụng chung tmp
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) sleepSync(attempt === 1 ? 50 : 150);
+      try {
+        const dir = path.dirname(this.statePath);
+        if (dir && dir !== '.' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const pairs = {};
+        for (const [k, st] of this.map.entries()) {
+          const { inflight_count, inflight_tokens, ...durable } = st;
+          void inflight_count;
+          void inflight_tokens;
+          pairs[k] = durable;
+        }
+        // Atomic write: ghi vào .tmp rồi rename để tránh corruption nếu crash giữa chừng
+        fs.writeFileSync(tmpPath, JSON.stringify({ pairs }, null, 2), 'utf8');
+        fs.renameSync(tmpPath, this.statePath);
+        if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+        return true;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    console.warn(`[StateStore] persist failed after 3 attempts: ${lastErr.message} — state sẽ tự ghi lại ở lần mutation kế tiếp (hoặc retry an toàn sau 1s)`);
+    if (mayScheduleRetry && !this._retryTimer) {
+      this._retryTimer = setTimeout(() => {
+        this._retryTimer = null;
+        this._writeState(false);
+      }, 1000);
+      if (typeof this._retryTimer.unref === 'function') this._retryTimer.unref(); // không giữ process sống
+    }
+    return false;
   }
 
   /** Huỷ debounce timer và ghi state ngay (dùng khi shutdown). */

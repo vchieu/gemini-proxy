@@ -21,6 +21,18 @@ function main() {
     logger.info(`gemini-proxy listening on http://localhost:${settings.port}`);
     logger.info(`Loaded ${enabledKeys}/${keys.length} keys, ${models.length} models, strategy=${settings.strategy}`);
   });
+  // Port bị chiếm (instance thứ 2 start khi instance 1 đang chạy) hay lỗi listen khác:
+  // log rõ ràng + exit ngay. Không có handler này -> EventEmitter ném 'error' thô
+  // (stack trace khó hiểu), và instance 2 sống trùng còn gây EPERM khi 2 process
+  // cùng đọc/ghi state.json (xem state/store.js persist).
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      logger.error(`Port ${settings.port} đã bị chiếm — đã có instance gemini-proxy khác đang chạy? Dừng instance cũ trước khi start lại.`);
+    } else {
+      logger.error(`Server listen error: ${err.message}`);
+    }
+    process.exit(1);
+  });
   const shutdown = (sig) => {
     logger.info(`${sig} received, flushing state`);
     stateStore.flush();
@@ -29,6 +41,9 @@ function main() {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('unhandledRejection', (reason) => {
+    logger.error('Unhandled Promise Rejection:', { error: reason instanceof Error ? reason.stack || reason.message : String(reason) });
+  });
 }
 
 if (require.main === module) {
