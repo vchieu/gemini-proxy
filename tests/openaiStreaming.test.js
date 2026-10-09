@@ -25,6 +25,17 @@ function makeReadableStream(chunks) {
   });
 }
 
+// Stream nhận Uint8Array THÔ (không qua string) — cần cho test UTF-8 split (H1),
+// vì encode(decode(half)) sẽ tự làm hỏng byte đa-byte ngay trong test.
+function makeRawStream(byteChunks) {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of byteChunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+}
+
 function post(port, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
@@ -231,12 +242,16 @@ describe('streamOpenAiPassthrough (upstream_mode=openai_compat)', () => {
   it('mid-stream in-band error chunk -> forwards error, NO [DONE], NO recordSuccess, releases reservation (H2)', async () => {
     const store = new StateStore(null);
     const inBandErr = 'data: {"error":{"code":429,"message":"Resource exhausted: quota exceeded"}}\n\n';
+    let upstreamCancelled = false; // M6: reader PHẢI được cancel sau in-band error
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify(chatChunk('c1', 'partial')) + '\n\n'));
+        controller.enqueue(new TextEncoder().encode(inBandErr));
+      },
+      cancel() { upstreamCancelled = true; },
+    });
     const server = await makeApp(store, {
-      callOpenAIStream: async () => ({
-        ok: true,
-        status: 200,
-        body: makeReadableStream(['data: ' + JSON.stringify(chatChunk('c1', 'partial')) + '\n\n', inBandErr]),
-      }),
+      callOpenAIStream: async () => ({ ok: true, status: 200, body }),
     });
     try {
       const res = await post(server.address().port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
@@ -246,6 +261,45 @@ describe('streamOpenAiPassthrough (upstream_mode=openai_compat)', () => {
       const st = store.get('key-1', 'a');
       assert.equal(st.daily_count, 0, 'must NOT recordSuccess');
       assert.equal(st.inflight_count, 0, 'reservation must be released');
+      assert.ok(st.cooldown_until > Date.now(), 'in-band 429 must set cooldown (M2) — nếu không request sau chọn lại đúng cặp cạn quota');
+      assert.equal(upstreamCancelled, true, 'upstream reader must be cancelled after in-band error (M6)');
+    } finally { server.close(); }
+  });
+
+  it('in-band 429 "per day" -> cooldown tới daily_reset_at, không phải 30s (M3)', async () => {
+    const store = new StateStore(null);
+    const inBandErr = 'data: ' + JSON.stringify({
+      error: { code: 429, message: "Quota exceeded for quota metric 'GenerateContent requests per day' and limit 'GenerateContent requests per day'" },
+    }) + '\n\n';
+    const server = await makeApp(store, {
+      callOpenAIStream: async () => ({ ok: true, status: 200, body: makeReadableStream([inBandErr]) }),
+    });
+    try {
+      const res = await post(server.address().port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      const st = store.get('key-1', 'a');
+      assert.equal(st.cooldown_until, st.daily_reset_at, 'daily quota -> cooldown phải là daily_reset_at (nửa đêm PT)');
+    } finally { server.close(); }
+  });
+
+  it('decodes UTF-8 multi-byte char split giữa 2 network chunk (H1) — không được ra U+FFFD', async () => {
+    const store = new StateStore(null);
+    const text = 'Xin chào thế giới 🌍 — emoji + CJK: 漢字重慶';
+    const sse = 'data: ' + JSON.stringify(chatChunk('c1', text)) + '\n\ndata: [DONE]\n\n';
+    const bytes = new TextEncoder().encode(sse);
+    // Cắt NGAY SAU byte đầu tiên của 1 ký tự đa-byte (byte >= 0x80) — đúng cửa sổ
+    // từng làm hỏng Unicode khi decode từng chunk network riêng lẻ.
+    const cut = bytes.findIndex((b) => b >= 0x80) + 1;
+    assert.ok(cut > 0 && cut < bytes.length, 'test premise: phải cắt được giữa 1 ký tự UTF-8');
+    const server = await makeApp(store, {
+      callOpenAIStream: async () => ({ ok: true, status: 200, body: makeRawStream([bytes.slice(0, cut), bytes.slice(cut)]) }),
+    });
+    try {
+      const res = await post(server.address().port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      assert.ok(res.body.includes(text), `payload must be forwarded intact, got: ${res.body.slice(0, 300)}`);
+      assert.ok(!res.body.includes('\uFFFD'), 'no replacement characters — multi-byte char must survive the chunk split');
+      assert.equal(countOf(res.body, '[DONE]'), 1);
     } finally { server.close(); }
   });
 

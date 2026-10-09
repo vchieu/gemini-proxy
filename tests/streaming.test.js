@@ -192,9 +192,14 @@ describe('streaming route (ReadableStream body)', () => {
 
     const errorChunk = JSON.stringify({ error: { code: 429, message: 'Resource exhausted: quota exceeded' } });
     const sse = `data: ${errorChunk}\n\n`;
+    let upstreamCancelled = false; // M6
+    const body = new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(sse)); },
+      cancel() { upstreamCancelled = true; },
+    });
 
     const fakeClient = {
-      callGeminiStream: async () => ({ body: makeReadableStream([sse]) }),
+      callGeminiStream: async () => ({ body }),
     };
 
     const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
@@ -209,6 +214,44 @@ describe('streaming route (ReadableStream body)', () => {
       assert.ok(res.body.includes('Resource exhausted'), 'should emit error payload');
       const st = store.get('key-1', 'm');
       assert.equal(st.daily_count, 0, 'should NOT count quota on error');
+      assert.ok(st.cooldown_until > Date.now(), 'in-band 429 phải set cooldown (M2)');
+      assert.equal(upstreamCancelled, true, 'reader phải được cancel sau in-band error (M6)');
+    } finally {
+      server.close();
+    }
+  });
+
+  it('decodes UTF-8 multi-byte char split giữa 2 network chunk (H1) — không được ra U+FFFD', async () => {
+    const store = new StateStore(null);
+    const models = [{ name: 'm', priority: 1, limits: { rpm: 100, rpd: 1000, tpm: 1000000 } }];
+    const keys = [{ id: 'key-1', api_key: 'k1', enabled: true }];
+    const text = 'Xin chào thế giới 🌍 — emoji + CJK: 漢字重慶';
+    const sse = 'data: ' + JSON.stringify({
+      candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }],
+    }) + '\n\n';
+    const bytes = new TextEncoder().encode(sse);
+    // Cắt NGAY SAU byte đầu tiên của 1 ký tự đa-byte — đúng cửa sổ từng làm hỏng Unicode
+    const cut = bytes.findIndex((b) => b >= 0x80) + 1;
+    assert.ok(cut > 0 && cut < bytes.length, 'test premise: phải cắt được giữa 1 ký tự UTF-8');
+    const rawStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, cut));
+        controller.enqueue(bytes.slice(cut));
+        controller.close();
+      },
+    });
+
+    const fakeClient = { callGeminiStream: async () => ({ body: rawStream }) };
+    const app = createServer({ models, keys, stateStore: store, config: { upstream_mode: 'translate' }, geminiClient: fakeClient });
+    const server = app.listen(0);
+    await new Promise((r) => server.once('listening', r));
+    const port = server.address().port;
+
+    try {
+      const res = await post(port, { model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(res.status, 200);
+      assert.ok(res.body.includes(text), `chunk text must be intact, got: ${res.body.slice(0, 300)}`);
+      assert.ok(!res.body.includes('\uFFFD'), 'no replacement characters — multi-byte char must survive the chunk split');
     } finally {
       server.close();
     }

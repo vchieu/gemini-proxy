@@ -72,6 +72,9 @@ function loadConfig(configDir) {
   // ---- settings ----
   const settings = {
     port: settingsRaw.port !== undefined ? settingsRaw.port : 8787,
+    // H2: mặc định chỉ bind loopback — proxy local không auth, bind 0.0.0.0 sẽ
+    // cho cả LAN/Wi-Fi dùng được key của bạn. Muốn expose ra mạng phải set chủ động.
+    host: settingsRaw.host !== undefined ? settingsRaw.host : '127.0.0.1',
     strategy: settingsRaw.strategy || 'round_robin_key_then_model',
     state_file: settingsRaw.state_file || './data/state.json',
     log_level: settingsRaw.log_level || 'info',
@@ -86,6 +89,9 @@ function loadConfig(configDir) {
   }
   if (typeof settings.port !== 'number' || !(settings.port > 0 && settings.port < 65536)) {
     throw new Error('config.json: port must be 1..65535');
+  }
+  if (typeof settings.host !== 'string' || settings.host.trim() === '') {
+    throw new Error('config.json: host must be a non-empty string (vd "127.0.0.1", "0.0.0.0")');
   }
   if (!VALID_STRATEGIES.includes(settings.strategy)) {
     throw new Error(`config.json: strategy must be one of ${VALID_STRATEGIES.join(', ')}`);
@@ -103,4 +109,4 @@ function loadConfig(configDir) {
   return { keys, models, settings };
 }
 
-module.exports = { loadConfig, VALID_STRATEGIES, DEFAULT_LIMITS };
+module.exports = { loadConfig, VALID_STRATEGIES, VALID_UPSTREAM_MODES, DEFAULT_LIMITS };

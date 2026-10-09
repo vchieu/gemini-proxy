@@ -293,8 +293,8 @@ Chạy full test.
   xác định Case B trong Phase 6) + **6 test bổ sung sau review code** (fallback `estimated`
   khi thiếu `usage`, wiring shim qua `handleRequest`, điền `index`, phát hiện `late`,
   Case B stream).
-- Số test thực tế: **124** (đã ghi vào `README.md` §Test, `AGENTS.md` §4, `gemini-proxy-plan.md` §8).
-- Soát nhanh bằng mắt: không có `console.log(api_key)`; không `require` vòng (`api/openaiPassthrough.js` không require `api/server.js`; `api/signatureShim.js` chỉ require `./translate`).
+- Số test thực tế: **124** tại thời điểm kết thúc migration (con số hiện tại xem `README.md` §Test / `AGENTS.md` §4 — đã tăng do các round review sau).
+- Soát nhanh bằng mắt: không có `console.log(api_key)`; không `require` vòng (`api/openaiPassthrough.js` không require `api/server.js`; `api/signatureShim.js` require `utils/toolCallId.js` — **KHÔNG** còn `require ./translate`, note cũ "chỉ require ./translate" đã lạc hậu).
 
 ---
 

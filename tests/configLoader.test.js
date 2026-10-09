@@ -88,3 +88,39 @@ describe('config/loader upstream_mode', () => {
     }
   });
 });
+
+describe('config/loader host (H2 — mặc định chỉ bind loopback)', () => {
+  it('defaults host to 127.0.0.1 when absent', () => {
+    const dir = makeTmpConfig({});
+    try {
+      assert.equal(loadConfig(dir).settings.host, '127.0.0.1');
+    } finally {
+      rmTmp(dir);
+    }
+  });
+
+  it('accepts explicit host (vd 0.0.0.0 để expose ra LAN)', () => {
+    const dir = makeTmpConfig({ host: '0.0.0.0' });
+    try {
+      assert.equal(loadConfig(dir).settings.host, '0.0.0.0');
+    } finally {
+      rmTmp(dir);
+    }
+  });
+
+  it('throws on empty or non-string host', () => {
+    for (const bad of ['', '   ', 42, null]) {
+      const dir = makeTmpConfig({ host: bad });
+      try {
+        assert.throws(() => loadConfig(dir), /host must be a non-empty string/, `host=${JSON.stringify(bad)} must throw`);
+      } finally {
+        rmTmp(dir);
+      }
+    }
+  });
+
+  it('exports VALID_UPSTREAM_MODES (PLAN-openai-compat-migration Phase 2.2)', () => {
+    const { VALID_UPSTREAM_MODES } = require('../config/loader');
+    assert.deepEqual(VALID_UPSTREAM_MODES, ['translate', 'openai_compat']);
+  });
+});

@@ -17,8 +17,11 @@ function main() {
   const app = createServer({ models, keys, stateStore, config: settings });
 
   const enabledKeys = keys.filter((k) => k.enabled !== false).length;
-  const server = app.listen(settings.port, () => {
-    logger.info(`gemini-proxy listening on http://localhost:${settings.port}`);
+  // H2: bind theo settings.host (mặc định 127.0.0.1 — chỉ loopback). Muốn cho
+  // LAN/Wi-Fi truy cập phải set "host": "0.0.0.0" chủ động trong config.json.
+  const host = settings.host || '127.0.0.1';
+  const server = app.listen(settings.port, host, () => {
+    logger.info(`gemini-proxy listening on http://${host}:${settings.port}`);
     logger.info(`Loaded ${enabledKeys}/${keys.length} keys, ${models.length} models, strategy=${settings.strategy}`);
   });
   // Port bị chiếm (instance thứ 2 start khi instance 1 đang chạy) hay lỗi listen khác:

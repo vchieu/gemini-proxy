@@ -89,6 +89,44 @@ describe('callGemini error handling (mock global.fetch, real Response)', () => {
       }
     );
   });
+
+  it('403 "GenerateContent ... blocked" (chứa "rate" trong generateContent) KHÔNG được coi là 429 (M1)', async () => {
+    // Regex cũ /quota|rate|limit|retry/i match裸 "rate" trong "generateContent"
+    // -> 403 thật bị nhầm429, client nhận aggregated 429 thay vì403 gốc.
+    const g = googleErr(403, 'PERMISSION_DENIED',
+      'Requests to this API method generateContent are blocked for project 123.');
+    global.fetch = async () => jsonRes(403, g);
+    await assert.rejects(
+      () => callGemini(KEY, MODEL, {}),
+      (e) => {
+        assert.ok(e instanceof GeminiError, `expected GeminiError, got ${e.name}: ${e.message}`);
+        assert.equal(e.status, 403, '403 phải được trả về nguyên vẹn, không được coi là 429');
+        return true;
+      }
+    );
+  });
+
+  it('403 "API has not been used in project ... or it is disabled" KHÔNG được coi là 429 (M1)', async () => {
+    const g = googleErr(403, 'PERMISSION_DISABLED',
+      'Google Cloud Project has not enabled the API. Enable it by visiting https://console.developers.google.com/?api=generateContent then retry.');
+    global.fetch = async () => jsonRes(403, g);
+    await assert.rejects(
+      () => callGemini(KEY, MODEL, {}),
+      (e) => {
+        assert.ok(e instanceof GeminiError, `expected GeminiError, got ${e.name}: ${e.message}`);
+        assert.equal(e.status, 403);
+        return true;
+      }
+    );
+  });
+
+  it('403 "Rate limit hit. Please retry in 9s." VẪN là Gemini429Error (M1 — không được làm chết nhánh quota thật)', async () => {
+    global.fetch = async () => jsonRes(403, googleErr(403, 'PERMISSION_DENIED', 'Rate limit hit. Please retry in 9s.'));
+    await assert.rejects(
+      () => callGemini(KEY, MODEL, {}),
+      (e) => e instanceof Gemini429Error && e.status === 429 && e.retryDelaySeconds === 9
+    );
+  });
 });
 
 describe('callGeminiStream error handling (mock global.fetch, real Response)', () => {

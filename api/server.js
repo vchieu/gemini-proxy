@@ -2,6 +2,7 @@ const express = require('express');
 const { handleRequest, openStream, Aggregated429Error } = require('../router/fallbackLoop');
 const { streamOpenAiPassthrough } = require('./openaiPassthrough');
 const { geminiChunkToOpenAiChunk, attachThoughtSignature } = require('./translate');
+const { cooldownUntilFor429, DEFAULT_COOLDOWN_SECONDS } = require('../client/errorParser');
 const { logger } = require('../utils/logger');
 
 function errorToOpenAi(status, message, code) {
@@ -102,8 +103,13 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     }
 
     if (agentRequest.stream !== true) {
+      // Client ngắt kết nối giữa chừng -> huỷ luôn upstream request (giữ signal
+      // trong ctx của withFallback), không giữ reservation tới khi timeout 60s.
+      const aborter = new AbortController();
+      const onCloseAbort = () => { if (!res.writableEnded) aborter.abort(); };
+      res.on('close', onCloseAbort);
       try {
-        const result = await handleRequest(agentRequest, deps);
+        const result = await handleRequest(agentRequest, deps, { signal: aborter.signal });
         // tool_call không có thoughtSignature -> id ở format cũ, replay history Gemini 3 sẽ 400.
         // Hai mode đều nhúng sig vào id (translate: geminiToOpenAi; openai_compat: signatureShim)
         // nên điều kiện chỉ cần là "id không bắt đầu bằng callsig_".
@@ -120,7 +126,11 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         }
         return res.json(result.openAiResponse);
       } catch (e) {
+        // 499 = client đã ngắt (upstream bị huỷ) — không còn ai để trả lỗi
+        if (e.status === 499 || res.destroyed) return;
         return sendError(res, e, config);
+      } finally {
+        res.off('close', onCloseAbort);
       }
     }
 
@@ -135,8 +145,10 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     const { upstream, pair, release } = handle;
     logger.info(`Stream start: key=${pair.key.id} model=${pair.model.name}`);
 
-    // openai_compat: passthrough SSE ở mức event (không defer thoughtSignature —
-    // signature do Google endpoint tự lo, xem PLAN-openai-compat-migration.md Phase 4)
+    // openai_compat: passthrough SSE ở mức event — thoughtSignature được roundtrip
+    // qua tool_call id bởi signatureShim.chunkToClient (KHÔNG defer như nhánh
+    // translate; không yêu cầu sig tới trước khi ghi chunk), xem
+    // PLAN-openai-compat-migration.md Phase 4 + docs/openai-compat-spike.md Q1/Q2
     if (upstreamMode === 'openai_compat') {
       try {
         await streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi });
@@ -261,6 +273,24 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         streamError = new Error(errObj.message || 'Stream error from upstream');
         streamError.status = errObj.code || 500;
         logger.error(`Stream error in chunk: ${streamError.message}`, { status: streamError.status });
+        // M2: 429 in-band mid-stream PHẢI set cooldown — nếu không request kế tiếp
+        // lại chọn đúng cặp vừa cạn quota và fail y hệt.
+        if (streamError.status === 429) {
+          const pairState = stateStore.get(pair.key.id, pair.model.name);
+          const cooldownUntil = cooldownUntilFor429(
+            { error: errObj },
+            {
+              defaultCooldownSeconds: (config && config.default_cooldown_seconds) || DEFAULT_COOLDOWN_SECONDS,
+              dailyResetAt: pairState.daily_reset_at,
+            }
+          );
+          stateStore.setCooldown(pair.key.id, pair.model.name, cooldownUntil);
+          logger.warn(`Stream: in-band 429 -> set cooldown`, {
+            key: pair.key.id,
+            model: pair.model.name,
+            cooldown_until: new Date(cooldownUntil).toISOString(),
+          });
+        }
         return;
       }
 
@@ -329,6 +359,9 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
     };
 
     let buffer = '';
+    // H1: decoder DUY NHẤT cho cả stream — decode từng chunk network riêng lẻ sẽ
+    // hỏng ký tự UTF-8 đa-byte bị cắt đôi ở ranh giới chunk (thành U+FFFD).
+    const decoder = new TextDecoder('utf-8');
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -337,7 +370,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
           reader.cancel().catch(() => {});
           break;
         }
-        buffer += Buffer.from(value).toString('utf8');
+        buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop();
         for (const line of lines) {
@@ -346,6 +379,7 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
         }
         if (clientAborted || streamError) break;
       }
+      buffer += decoder.decode(); // flush byte còn sót (hoàn tất multi-byte cuối nếu có)
       if (!clientAborted && !streamError && buffer) handleLine(buffer); // dòng cuối không có '\n'
       if (!clientAborted && !streamError && dataLines.length > 0) processEvent(dataLines.join('\n')); // event cuối thiếu dòng trống
       dataLines = [];
@@ -355,6 +389,9 @@ function createServer({ models, keys, stateStore, config, geminiClient }) {
       logger.error(`Stream interrupted: ${e.message}`);
     } finally {
       release();
+      // M6: nhánh break vì in-band error KHÔNG hề cancel reader -> kết nối upstream
+      // bị giữ tới idle timeout 60s. Cancel ở đây là no-op nếu stream đã đóng.
+      reader.cancel().catch(() => {});
       if (streamCompleted) {
         flushDeferred(); // xả phần trì hoãn TRƯỚC [DONE] (kể cả khi sig không đến — đã warn)
         stateStore.recordSuccess(pair.key.id, pair.model.name, totalTokens);

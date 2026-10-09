@@ -127,6 +127,7 @@ Ngoài ra còn thấy:
 | 2 | Signature có thể đến **sau** delta đã chứa `id` | L6 chỉ pass vì sig đi cùng delta với id. Nếu id đã gửi trước, client giữ id cũ → replay 400. **Đã xử lý (phát hiện):** cờ `late` của `chunkToClient` + WARN ở `openaiPassthrough`. Chưa có giải pháp sửa gốc (muốn sửa thì phải defer chunk như nhánh `translate` — nếu gặp WARN này ngoài thực tế thì mới làm). |
 | 3 | `usage` nằm trên chunk có `choices` | Xem Q5 — không ảnh hưởng quota. |
 | 4 | 503 "high demand" xảy ra thường xuyên với free tier | Đã là lý do plan có nhánh 5xx fallback. |
+| 5 | ~~**CHƯA XÁC MINH (M4):** sig minted bởi model/key A có được model/key B accept khi replay history không?~~ | ✅ **ĐÃ XÁC MINH LIVE 2026-10-09 (không phải vấn đề):** mint tool_call `tool_choice:required` trên `gemini-3.7-flash` (key-1) → id `callsig_…` (sig ~500+ chars), replay history `[user, assistant(tool_calls), tool(result)]` sang `gemini-3.6-flash` (key-2) — **cả model lẫn key đều khác** → **HTTP 200**, content trả về đúng ("The current weather in Paris is 21°C"). Kết luận: Google KHÔNG bind signature theo model/key (ít nhất trong cùng project) → proxy xoay cặp rồi replay `callsig_…` là an toàn. Lưu ý phụ: presence of sig KHÔNG ổn định — cùng `tool_choice:required`, run live-test `L3` không nhận sig nào (id `call_…`) mà replay vẫn 200 (L4/L5/L11), run riêng có sig. |
 
 ---
 

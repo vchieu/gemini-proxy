@@ -176,6 +176,51 @@ describe('fallbackLoop upstream_mode=openai_compat', () => {
     assert.equal(deps.stateStore.get('key-1', 'b').daily_count, 1);
   });
 
+  it('429 quota theo NGÀY không retryDelay -> cooldown tới nửa đêm PT, không phải 30s (M3)', async () => {
+    // Trước đây429 günlimit không retryDelay rơi về default 30s -> cặp bị retry
+    // vô ích mỗi 30s trong suốt ngày. M3:cooldown tới daily_reset_at.
+    let calls = 0;
+    const deps = makeDeps({ client: {
+      callOpenAI: async (key, model) => {
+        calls += 1;
+        if (model.name === 'a') {
+          throw new Gemini429Error(
+            "Quota exceeded for quota metric 'GenerateContent requests per day' and limit 'GenerateContent requests per day'"
+          );
+        }
+        return OPENAI_OK;
+      },
+    } });
+
+    const out = await handleRequest(req, deps);
+
+    assert.equal(calls, 2);
+    assert.equal(out.usedModel, 'b');
+    const a = deps.stateStore.get('key-1', 'a');
+    assert.equal(a.cooldown_until, a.daily_reset_at, 'daily quota -> cooldown PHẢI là daily_reset_at (nửa đêm PT)');
+  });
+
+  it('429 per-day NHƯNG có retryDelay tường minh -> tôn trọng retryDelay (M3 không đè Google)', async () => {
+    let calls = 0;
+    const deps = makeDeps({ client: {
+      callOpenAI: async (key, model) => {
+        calls += 1;
+        if (model.name === 'a') {
+          throw new Gemini429Error('Quota per day exceeded, retry in 45s', { retryDelaySeconds: 45 });
+        }
+        return OPENAI_OK;
+      },
+    } });
+
+    await handleRequest(req, deps);
+
+    assert.equal(calls, 2);
+    const a = deps.stateStore.get('key-1', 'a');
+    // Google gửi retryDelay 45s -> KHÔNG được đẩycooldown tới nửa đêm PT
+    assert.ok(a.cooldown_until < Date.now() + 60000, `expected ~45s cooldown, got ${a.cooldown_until - Date.now()}ms`);
+    assert.ok(a.cooldown_until > Date.now() + 40000);
+  });
+
   it('503 on model a -> fallback to b with NO cooldown and NO quota on a', async () => {
     let calls = 0;
     const deps = makeDeps({ client: {

@@ -282,7 +282,7 @@ async function main() {
       tool_choice: 'required',
     });
     const events = sseEvents(r.text);
-    let id = null, name = '', args = '', indexOk = true, sawIndex = false;
+    let id = null, name = '', args = '', sawIndex = false;
     for (const e of events) {
       const d = e.choices && e.choices[0] && e.choices[0].delta;
       const tc = d && d.tool_calls && d.tool_calls[0];
@@ -292,7 +292,6 @@ async function main() {
       if (tc.function && tc.function.name) name = tc.function.name;
       if (tc.function && tc.function.arguments) args += tc.function.arguments;
     }
-    if (sawIndex) indexOk = true;
     let argsOk = false;
     try { JSON.parse(args); argsOk = true; } catch (_) { argsOk = false; }
     if (!id || !name || !argsOk) {

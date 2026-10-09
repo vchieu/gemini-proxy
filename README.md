@@ -25,6 +25,11 @@ npm start
 > Nếu cổng đã bị chiếm (đang có instance khác chạy), proxy log rõ lỗi và thoát ngay —
 > **không start 2 instance cùng lúc** (2 process cùng ghi `state.json` sẽ đá nhau).
 
+> **Mặc định proxy chỉ nghe trên `127.0.0.1` (loopback)** — an toàn vì proxy không có
+> authentication, ai trên cùng LAN/Wi-Fi gọi được thì đốt hết quota key của bạn.
+> Muốn expose ra mạng phải chủ động set `"host": "0.0.0.0"` trong `config/config.json`
+> (và tự chịu trách nhiệm che chắn).
+
 3. Trỏ agent tới OpenAI-compatible endpoint:
 
 - Base URL: `http://localhost:8787/v1`
@@ -37,7 +42,7 @@ npm start
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI-compatible chat (hỗ trợ `stream: true` SSE, tool/function-calling: `tools`, `tool_choice`, `tool_calls`). Khi `upstream_mode=openai_compat`: body được forward nguyên bản (chỉ đổi `model`) tới endpoint OpenAI-compat của Google, không qua `api/translate.js` |
 | POST | `/v1beta/models/:modelAction` | **Gemini-native**: truyền body thô lên Gemini, chọn cặp `(key, model)`, fallback 429/5xx. `:modelAction` là `modelName:action` (ví dụ `gemini-2.5-flash:generateContent`). Hỗ trợ `generateContent` và `streamGenerateContent`. |
-| GET | `/v1beta/models` | Danh sách model dạng Google (`name`, `displayName`, `supportedGenerationMethods`) |
+| GET | `/v1beta/models` | Danh sách model theo **shape Google** `{ models: [{ name: "models/<id>", displayName, supportedGenerationMethods }] }` (SDK Google parse đúng) |
 | GET | `/v1/models` | Danh sách model đang cấu hình |
 | GET | `/admin/status` | Debug: quota đã dùng / còn lại từng cặp (key, model) + `upstream_mode` đang chạy |
 | GET | `/health` | Health check |
@@ -71,7 +76,7 @@ npm start
 
 - `config/keys.json` — danh sách key (`id`, `api_key`, `enabled`). **Không nằm trong git** (đã `.gitignore`); tạo từ mẫu `config/keys.example.json`.
 - `config/models.json` — danh sách model (`name`, `priority` càng nhỏ càng ưu tiên, `limits: {rpm, rpd, tpm}`).
-- `config/config.json` — `port`, `strategy` (`round_robin_key_then_model` mặc định, hoặc `priority_model_first`), `state_file`, `log_level`, `request_timeout_ms`, `max_fallback_attempts`, `respect_agent_model`, `default_cooldown_seconds` (số >= 0 — validate lúc nạp config), `upstream_mode` (**`openai_compat` mặc định** — passthrough body OpenAI gốc tới endpoint OpenAI-compat của Google `/v1beta/openai/chat/completions`, bỏ qua `api/translate.js`; `translate` — legacy, dịch format OpenAI ↔ Gemini native). Override bằng biến môi trường `UPSTREAM_MODE` (ưu tiên hơn config file).
+- `config/config.json` — `port`, `host` (**mặc định `127.0.0.1`** — chỉ nghe loopback; set `0.0.0.0` để expose ra LAN, proxy không có auth nên đây là hành động chủ động), `strategy` (`round_robin_key_then_model` mặc định, hoặc `priority_model_first`), `state_file`, `log_level`, `request_timeout_ms`, `max_fallback_attempts`, `respect_agent_model`, `default_cooldown_seconds` (số >= 0 — validate lúc nạp config), `upstream_mode` (**`openai_compat` mặc định** — passthrough body OpenAI gốc tới endpoint OpenAI-compat của Google `/v1beta/openai/chat/completions`, bỏ qua `api/translate.js`; `translate` — legacy, dịch format OpenAI ↔ Gemini native). Override bằng biến môi trường `UPSTREAM_MODE` (ưu tiên hơn config file).
 - File state (`state_file`, mặc định `data/state.json`) — ghi atomic (tmp rồi rename) **có retry** khi file bị antivirus/process khác giữ đúng lúc rename trên Windows (lỗi `EPERM: ... rename ...` trước đây làm mất lần ghi đó); retry đồng bộ 3 lần + 1 lần an toàn sau 1s, vẫn fail thì lần ghi ở mutation kế tiếp sẽ bù. File tmp cũ được dọn tự lúc khởi động.
 
 Quota reset ngày tính theo **nửa đêm Pacific Time** (theo Gemini free-tier).
@@ -82,10 +87,11 @@ Quota reset ngày tính theo **nửa đêm Pacific Time** (theo Gemini free-tier
 npm test
 ```
 
-**137/137 test pass** (21 suite) — gồm 36 test cho nhánh `upstream_mode=openai_compat`
+**154/154 test pass** (23 suite) — gồm 36 test cho nhánh `upstream_mode=openai_compat`
 (`tests/configLoader.test.js`, `tests/openaiClient.test.js`, `tests/openaiFallback.test.js`,
-`tests/openaiStreaming.test.js`), 12 test `tests/signatureShim.test.js` và 4 test
-`tests/concurrency.test.js` cho persist bền với Windows EPERM (retry, self-heal, dọn tmp, safety-net).
+`tests/openaiStreaming.test.js`), 12 test `tests/signatureShim.test.js`, 4 test
+`tests/concurrency.test.js` cho persist bền với Windows EPERM (retry, self-heal, dọn tmp, safety-net)
+và 3 test `tests/abortOnDisconnect.test.js` cho abort upstream khi client ngắt non-stream.
 
 ## Tài liệu khác
 

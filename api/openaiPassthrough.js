@@ -1,5 +1,6 @@
 const { logger } = require('../utils/logger');
 const { chunkToClient } = require('./signatureShim');
+const { cooldownUntilFor429, DEFAULT_COOLDOWN_SECONDS } = require('../client/errorParser');
 
 /**
  * Stream passthrough SSE cho `upstream_mode=openai_compat` (xem plan
@@ -112,6 +113,24 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
         streamError.status = errObj.code || 500;
         streamError.alreadyEmitted = true;
         logger.error('openai_passthrough: stream error in chunk', { message: streamError.message, status: streamError.status });
+        // M2: 429 in-band mid-stream PHẢI set cooldown — nếu không, request kế
+        // tiếp lại chọn đúng cặp vừa cạn quota và fail y hệt.
+        if (streamError.status === 429) {
+          const pairState = stateStore.get(pair.key.id, pair.model.name);
+          const cooldownUntil = cooldownUntilFor429(
+            { error: errObj },
+            {
+              defaultCooldownSeconds: (config && config.default_cooldown_seconds) || DEFAULT_COOLDOWN_SECONDS,
+              dailyResetAt: pairState.daily_reset_at,
+            }
+          );
+          stateStore.setCooldown(pair.key.id, pair.model.name, cooldownUntil);
+          logger.warn('openai_passthrough: in-band 429 -> set cooldown', {
+            key: pair.key.id,
+            model: pair.model.name,
+            cooldown_until: new Date(cooldownUntil).toISOString(),
+          });
+        }
         writeSse(payloadRaw);
         return;
       }
@@ -139,6 +158,9 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
     };
 
     // Đọc loop → tách dòng → gom event → forward
+    // H1: decoder DUY NHẤT cho cả stream — decode từng chunk network riêng lẻ sẽ
+    // hỏng ký tự UTF-8 đa-byte bị cắt đôi ở ranh giới chunk (thành U+FFFD).
+    const decoder = new TextDecoder('utf-8');
     let buffer = '';
     while (true) {
       const { done, value } = await reader.read();
@@ -147,7 +169,7 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
         reader.cancel().catch(() => {});
         break;
       }
-      buffer += Buffer.from(value).toString('utf8');
+      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop(); // giữ lại phần chưa có '\n'
       for (const line of lines) {
@@ -163,6 +185,7 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
       }
       if (clientAborted || streamError) break;
     }
+    buffer += decoder.decode(); // flush byte còn sót (hoàn tất multi-byte cuối nếu có)
     if (!clientAborted && !streamError && buffer) {
       const l = buffer.replace(/\r$/, '');
       if (l.startsWith('data:')) dataLines.push(l.slice(5).replace(/^ /, ''));
@@ -176,6 +199,9 @@ async function streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, s
     logger.error(`openai_passthrough: stream interrupted: ${e.message}`);
   } finally {
     release(); // idempotent — mọi nhánh đều gọi đúng 1 lần
+    // M6: nhánh break vì in-band error KHÔNG hề cancel reader -> kết nối upstream
+    // bị giữ tới idle timeout 60s. Cancel ở đây là no-op nếu stream đã đóng.
+    reader.cancel().catch(() => {});
 
     if (streamError && !clientAborted) {
       // Lỗi giữa chừng: KHÔNG recordSuccess, KHÔNG [DONE], báo lỗi dạng OpenAI

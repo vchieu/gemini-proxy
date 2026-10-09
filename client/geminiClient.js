@@ -33,7 +33,12 @@ const OPENAI_COMPAT_URL = 'https://generativelanguage.googleapis.com/v1beta/open
 // rỗng, vì chưa phát hiện field nào bị Google từ chối.
 const OPENAI_DROP_FIELDS = [];
 
-const QUOTA_RE = /quota|rate|limit|retry/i;
+// Nhận diện429 quota (kể cả 403 "quota" — Gemini đôi khi trả 403 khi hết quota).
+// ⚠ M1: KHÔNG được dùng裸 `rate`/`limit` — "generateContent" chứa chuỗi "rate",
+// và nhiều403 THẬT của Google ("...GenerateContent are blocked",
+// "Cloud API has not been used in project...") từng bị nhầm thành 429 -> cooldown
+// 30s vô lý + fallback + trả về aggregated 429 thay vì403 gốc cho client.
+const QUOTA_RE = /quota|\brate[- _]?limit|resource[_ ]exhausted|retry in/i;
 
 function buildUrl(model, apiKey, stream) {
   const action = stream ? 'streamGenerateContent' : 'generateContent';
@@ -42,6 +47,29 @@ function buildUrl(model, apiKey, stream) {
     `:${action}?key=${encodeURIComponent(apiKey)}` +
     (stream ? '&alt=sse' : '')
   );
+}
+
+/**
+ * Nối signal của client (nếu có) vào AbortController nội bộ: client ngắt kết nối
+ * giữa chừng (non-stream) -> huỷ luôn upstream request thay vì giữ reservation
+ * tới khi timeout 60s. Lỗi phân biệt được với timeout nhờ `options.signal.aborted`
+ * (ném GeminiError status 499 — non-429/non-5xx -> withFallback trả ngay, không
+ * tính quota, không set cooldown).
+ * @param {AbortController} controller
+ * @param {AbortSignal} [externalSignal]
+ * @returns {() => void} detach — gỡ listener (gọi trong finally)
+ */
+function attachExternalAbort(controller, externalSignal) {
+  if (!externalSignal) return () => {};
+  const onAbort = () => controller.abort();
+  if (externalSignal.aborted) controller.abort();
+  else externalSignal.addEventListener('abort', onAbort, { once: true });
+  return () => externalSignal.removeEventListener('abort', onAbort);
+}
+
+/** Lỗi đúng chuẩn khi upstream bị huỷ do client ngắt (status 499). */
+function clientAbortedError() {
+  return new GeminiError('Upstream request aborted (client disconnected)', { status: 499 });
 }
 
 /**
@@ -93,7 +121,7 @@ function buildHttpError(status, text) {
  * @param {ApiKeyConfig} key
  * @param {ModelConfig} model
  * @param {object} geminiRequestBody  // đã ở format Gemini (contents, generationConfig)
- * @param {{timeoutMs?: number}} options
+ * @param {{timeoutMs?: number, signal?: AbortSignal}} options  // signal: client ngắt -> huỷ upstream (499)
  * @returns {Promise<object>}  // response Gemini gốc, có usageMetadata
  * @throws {Gemini429Error} khi bị rate limit — error object cần có `.rawMessage` và `.details`
  * @throws {GeminiError} lỗi HTTP khác (`.status`, `.body` = JSON Google nếu parse được)
@@ -102,6 +130,7 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const detachAbort = attachExternalAbort(controller, options.signal);
   let res, text;
   try {
     res = await fetch(buildUrl(model, key.api_key, false), {
@@ -112,10 +141,14 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
     });
     text = await res.text(); // đọc body ĐÚNG 1 LẦN; timeout phủ cả lúc đọc body (#5)
   } catch (e) {
-    if (e.name === 'AbortError') throw new GeminiError(`Gemini request timeout after ${timeoutMs}ms`, { status: 504 });
+    if (e.name === 'AbortError') {
+      if (options.signal && options.signal.aborted) throw clientAbortedError();
+      throw new GeminiError(`Gemini request timeout after ${timeoutMs}ms`, { status: 504 });
+    }
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
   } finally {
     clearTimeout(timer);
+    detachAbort();
   }
 
   if (!res.ok) throw buildHttpError(res.status, text);
@@ -130,7 +163,7 @@ async function callGemini(key, model, geminiRequestBody, options = {}) {
  * @param {ApiKeyConfig} key
  * @param {ModelConfig} model
  * @param {object} openAiBody  // format OpenAI chat-completions (messages, tools, ...)
- * @param {{timeoutMs?: number}} options
+ * @param {{timeoutMs?: number, signal?: AbortSignal}} options  // signal: client ngắt -> huỷ upstream (499)
  * @returns {Promise<object>}  // JSON đã parse từ response
  * @throws {Gemini429Error} khi bị rate limit
  * @throws {GeminiError} lỗi HTTP khác
@@ -139,6 +172,7 @@ async function callOpenAI(key, model, openAiBody, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const detachAbort = attachExternalAbort(controller, options.signal);
   let res, text;
   try {
     const body = buildOpenAiBody(openAiBody, model, false);
@@ -153,10 +187,14 @@ async function callOpenAI(key, model, openAiBody, options = {}) {
     });
     text = await res.text(); // đọc body ĐÚNG 1 LẦN; timeout phủ cả lúc đọc body
   } catch (e) {
-    if (e.name === 'AbortError') throw new GeminiError(`Gemini request timeout after ${timeoutMs}ms`, { status: 504 });
+    if (e.name === 'AbortError') {
+      if (options.signal && options.signal.aborted) throw clientAbortedError();
+      throw new GeminiError(`Gemini request timeout after ${timeoutMs}ms`, { status: 504 });
+    }
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
   } finally {
     clearTimeout(timer);
+    detachAbort();
   }
 
   if (!res.ok) throw buildHttpError(res.status, text);

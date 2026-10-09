@@ -1,5 +1,5 @@
 const { selectAndReserve } = require('./selector');
-const { extractRetryDelaySeconds, DEFAULT_COOLDOWN_SECONDS } = require('../client/errorParser');
+const { cooldownUntilFor429, DEFAULT_COOLDOWN_SECONDS } = require('../client/errorParser');
 const { Gemini429Error } = require('../client/geminiClient');
 const { estimateTokens } = require('../utils/tokenEstimate');
 const { openAiToGemini, geminiToOpenAi } = require('../api/translate');
@@ -44,15 +44,6 @@ function isTransientUpstream(e) {
     && TRANSIENT_UPSTREAM_STATUS.has(e.status)
     && typeof e.message === 'string'
     && e.message.startsWith('Gemini error ');
-}
-
-function retrySecondsOf(e, defaultCooldown) {
-  let s = e.retryDelaySeconds;
-  if (!Number.isFinite(s) || s <= 0) {
-    s = extractRetryDelaySeconds({ error: { message: e.rawMessage || e.message, details: e.details } });
-    if (!Number.isFinite(s) || s <= 0) s = defaultCooldown;
-  }
-  return s;
 }
 
 /**
@@ -111,7 +102,7 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
 
     logger.info(`Attempt ${attempts + 1}: trying key=${pair.key.id} model=${pair.model.name}`);
     try {
-      const ctx = { geminiBody, estimated, timeoutMs };
+      const ctx = { geminiBody, estimated, timeoutMs, signal: options.signal };
       // Case B (xem api/signatureShim.js): dựng lại extra_content từ callsig_… trong id
       // trước khi gửi lên Google, nếu không replay history sẽ bị 400 missing signature.
       if (mode === 'openai_compat') ctx.openAiBody = signatureShim.requestToUpstream(agentRequest);
@@ -120,12 +111,27 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
     } catch (e) {
       stateStore.release(pair.key.id, pair.model.name, estimated);
       if (is429(e)) {
-        const retrySeconds = retrySecondsOf(e, defaultCooldown);
-        stateStore.setCooldown(pair.key.id, pair.model.name, Date.now() + Math.ceil(retrySeconds * 1000) + 500);
-        logger.warn(`429 from key=${pair.key.id} model=${pair.model.name}, cooldown ${retrySeconds}s`, { msg: e.message });
+        // Tính cooldown qua helper dùng chung (M2/M3): quota theo NGÀY không có
+        // retryDelay tường minh -> cooldown tới nửa đêm PT thay vì 30s.
+        const pairState = stateStore.get(pair.key.id, pair.model.name);
+        const cooldownUntil = cooldownUntilFor429(
+          { error: { message: e.rawMessage || e.message, details: e.details } },
+          {
+            defaultCooldownSeconds: defaultCooldown,
+            retryDelaySecondsHint: e.retryDelaySeconds,
+            dailyResetAt: pairState.daily_reset_at,
+          }
+        );
+        stateStore.setCooldown(pair.key.id, pair.model.name, cooldownUntil);
+        logger.warn(`429 from key=${pair.key.id} model=${pair.model.name}, cooldown tới ${new Date(cooldownUntil).toISOString()}`, { msg: e.message });
         triedPairs.push(pair);
         attempts += 1;
         continue;
+      }
+      if (e.status === 499) {
+        // Client đã ngắt kết nối giữa chừng -> không phải lỗi upstream, không log error
+        logger.info(`Client disconnected, aborted upstream call key=${pair.key.id} model=${pair.model.name}`);
+        throw e;
       }
       if (isTransientUpstream(e)) {
         // Lệch plan §5.5 (ghi rõ ở AGENTS.md §6.5): 5xx upstream là lỗi tạm thời của
@@ -144,17 +150,18 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   throw new Aggregated429Error('Đã thử hết số lần fallback cho phép', defaultCooldown);
 }
 
-/** Non-stream. Contract không đổi. */
-async function handleRequest(agentRequest, deps) {
+/** Non-stream. Contract không đổi (tham số `options` thêm optional, backward-compatible). */
+async function handleRequest(agentRequest, deps, options = {}) {
   const { geminiClient, stateStore } = deps;
   const { value: geminiRes, pair, estimated, attempts } = await withFallback(
     agentRequest, deps,
     (p, ctx) => {
       // Sử ctx.openAiBody nếu có (mode openai_compat), ngược lại dùng geminiBody
       const body = ctx.openAiBody || ctx.geminiBody;
-      if (ctx.openAiBody) return geminiClient.callOpenAI(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
-      return geminiClient.callGemini(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
-    }
+      if (ctx.openAiBody) return geminiClient.callOpenAI(p.key, p.model, body, { timeoutMs: ctx.timeoutMs, signal: ctx.signal });
+      return geminiClient.callGemini(p.key, p.model, body, { timeoutMs: ctx.timeoutMs, signal: ctx.signal });
+    },
+    { signal: options.signal }
   );
   const upstreamMode = (deps && deps.config && deps.config.upstream_mode) || 'openai_compat';
   // Cả 2 mode đều fallback về `estimated` khi upstream KHÔNG trả usage — nếu không,
@@ -210,12 +217,12 @@ async function openStream(agentRequest, deps) {
  * Gọi vớiFallback truyền { geminiBody } trực tiếp từ req.body.
  * Trả kết quả geminiResponse, keyId, model name, attempts.
  */
-async function handleNativeRequest(requestedModel, geminiBody, deps) {
+async function handleNativeRequest(requestedModel, geminiBody, deps, options = {}) {
   const { geminiClient, stateStore } = deps;
   const { value, pair, estimated, attempts } = await withFallback(
     { model: requestedModel }, deps,
-    (p, ctx) => geminiClient.callGemini(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs }),
-    { geminiBody }
+    (p, ctx) => geminiClient.callGemini(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs, signal: ctx.signal }),
+    { geminiBody, signal: options.signal }
   );
   let released = false;
   try {

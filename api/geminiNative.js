@@ -1,5 +1,6 @@
 const express = require('express');
 const { handleNativeRequest, openNativeStream, Aggregated429Error } = require('../router/fallbackLoop');
+const { cooldownUntilFor429, DEFAULT_COOLDOWN_SECONDS } = require('../client/errorParser');
 const { logger } = require('../utils/logger');
 
 function sendGeminiError(res, e, config) {
@@ -32,22 +33,34 @@ function createGeminiNativeRouter(deps) {
       return res.status(400).json({ error: { code: 400, message: 'Request body must be a JSON object', status: 'INVALID_ARGUMENT' } });
     }
     if (parsed.action === 'generateContent') {
+      // Client ngắt kết nối giữa chừng -> huỷ luôn upstream request, không giữ
+      // reservation tới khi timeout 60s (signal đi qua ctx của withFallback).
+      const aborter = new AbortController();
+      const onCloseAbort = () => { if (!res.writableEnded) aborter.abort(); };
+      res.on('close', onCloseAbort);
       try {
-        const r = await handleNativeRequest(parsed.model, body, deps);
+        const r = await handleNativeRequest(parsed.model, body, deps, { signal: aborter.signal });
         return res.json(r.geminiResponse);
-      } catch (e) { return sendGeminiError(res, e, config); }
+      } catch (e) {
+        if (e.status === 499 || res.destroyed) return; // client đã đi mất
+        return sendGeminiError(res, e, config);
+      } finally {
+        res.off('close', onCloseAbort);
+      }
     }
     return streamNative(req, res, parsed.model, body, deps).catch((e) => sendGeminiError(res, e, config));
   });
 
-  // GET /models at /v1beta only - minimal list
+  // GET /models — shape GOOGLE ListModels: { models: [{ name: 'models/<id>', ... }] }
+  // (không phải shape OpenAI { object, data } — SDK Google sẽ parse field `models`).
   router.get('/models', (req, res) => {
-    const data = models.map((m) => ({
-      name: m.name,
-      displayName: m.name,
-      supportedGenerationMethods: ['generateContent', 'streamGenerateContent']
-    }));
-    res.json({ object: 'list', data });
+    res.json({
+      models: models.map((m) => ({
+        name: `models/${m.name}`,
+        displayName: m.name,
+        supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+      })),
+    });
   });
 
   return router;
@@ -101,7 +114,35 @@ async function streamNative(req, res, requestedModel, body, deps) {
 
   // Dữ liệu SSE đang đượcaccumulate (gộp multi-line data:)
   let dataLines = [];
+  // Ghi nhận lỗi in-band từ upstream (dùng chung cho handleLine + event cuối)
+  const noteUpstreamError = (errObj) => {
+    streamError = new Error(errObj.message || 'Upstream stream error');
+    streamError.status = errObj.code || 500;
+    streamError.alreadyEmitted = true;
+    logger.error(`Native stream error in chunk: ${streamError.message}`);
+    // M2: 429 in-band mid-stream PHẢI set cooldown — nếu không request kế tiếp
+    // lại chọn đúng cặp vừa cạn quota và fail y hệt.
+    if (streamError.status === 429) {
+      const pairState = stateStore.get(pair.key.id, pair.model.name);
+      const cooldownUntil = cooldownUntilFor429(
+        { error: errObj },
+        {
+          defaultCooldownSeconds: (deps.config && deps.config.default_cooldown_seconds) || DEFAULT_COOLDOWN_SECONDS,
+          dailyResetAt: pairState.daily_reset_at,
+        }
+      );
+      stateStore.setCooldown(pair.key.id, pair.model.name, cooldownUntil);
+      logger.warn('Native stream: in-band 429 -> set cooldown', {
+        key: pair.key.id,
+        model: pair.model.name,
+        cooldown_until: new Date(cooldownUntil).toISOString(),
+      });
+    }
+  };
   let buffer = '';
+  // H1: decoder DUY NHẤT cho cả stream — decode từng chunk network riêng lẻ sẽ
+  // hỏng ký tự UTF-8 đa-byte bị cắt đôi ở ranh giới chunk (thành U+FFFD).
+  const decoder = new TextDecoder('utf-8');
   const handleLine = (line) => {
     const l = line.replace(/\r$/, '');
     if (l === '') {
@@ -113,10 +154,7 @@ async function streamNative(req, res, requestedModel, body, deps) {
           const g = JSON.parse(eventText);
           const errObj = (g && g.error) || (Array.isArray(g) && g[0] && g[0].error);
           if (errObj) {
-            streamError = new Error(errObj.message || 'Upstream stream error');
-            streamError.status = errObj.code || 500;
-            streamError.alreadyEmitted = true;
-            logger.error(`Native stream error in chunk: ${streamError.message}`);
+            noteUpstreamError(errObj);
           } else if (g.usageMetadata && g.usageMetadata.totalTokenCount) {
             totalTokens = g.usageMetadata.totalTokenCount;
           }
@@ -138,8 +176,8 @@ async function streamNative(req, res, requestedModel, body, deps) {
       // Ghi byte nguyên bản lên response
       res.write(value);
 
-      // Parse text để tìm data: lines
-      buffer += Buffer.from(value).toString('utf8');
+      // Parse text để tìm data: lines (decoder stream -> không hỏng UTF-8 đa-byte, H1)
+      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop();
       for (const line of lines) {
@@ -148,6 +186,7 @@ async function streamNative(req, res, requestedModel, body, deps) {
       }
       if (clientAborted || streamError) break;
     }
+    buffer += decoder.decode(); // flush byte còn sót (hoàn tất multi-byte cuối nếu có)
     // Đọc còn buffer (dòng cuối không có \n)
     if (!clientAborted && !streamError && buffer.trim()) handleLine(buffer);
     // Xử lý event cuối thiếu dòng trống
@@ -157,10 +196,7 @@ async function streamNative(req, res, requestedModel, body, deps) {
         const g = JSON.parse(eventText);
         const errObj = (g && g.error) || (Array.isArray(g) && g[0] && g[0].error);
         if (errObj) {
-          streamError = new Error(errObj.message || 'Upstream stream error');
-          streamError.status = errObj.code || 500;
-          streamError.alreadyEmitted = true;
-          logger.error(`Native stream error in chunk: ${streamError.message}`);
+          noteUpstreamError(errObj);
         } else if (g.usageMetadata && g.usageMetadata.totalTokenCount) {
           totalTokens = g.usageMetadata.totalTokenCount;
         }
@@ -172,6 +208,9 @@ async function streamNative(req, res, requestedModel, body, deps) {
     streamError = e;
   } finally {
     release();
+    // M6: nhánh break vì in-band error KHÔNG hề cancel reader -> kết nối upstream
+    // bị giữ tới idle timeout 60s. Cancel ở đây là no-op nếu stream đã đóng.
+    reader.cancel().catch(() => {});
 
     if (streamError && !clientAborted) {
       if (!streamError.alreadyEmitted && !res.writableEnded && !res.destroyed) {

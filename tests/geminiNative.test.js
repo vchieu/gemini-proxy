@@ -159,8 +159,13 @@ describe('gemini-native route', () => {
     const sse = 'data: ' + JSON.stringify({
       error: { code: 429, message: 'Quota exceeded' },
     }) + '\n\n';
+    let upstreamCancelled = false; // M6
+    const body = new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(sse)); },
+      cancel() { upstreamCancelled = true; },
+    });
     const fakeStreamClient = {
-      callGeminiStream: async () => ({ body: makeReadableStream([sse]) }),
+      callGeminiStream: async () => ({ body }),
     };
     const localApp = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeStreamClient });
     const localServer = localApp.listen(0);
@@ -170,7 +175,56 @@ describe('gemini-native route', () => {
       const res = await postStream(localPort, {});
       assert.equal(res.status, 200);
       assert.ok(res.body.includes('Quota exceeded'), 'should forward error in body');
-      assert.equal(store.get('key-1', 'gemini-2.5-flash').daily_count, 0, 'should NOT count quota on error');
+      const st = store.get('key-1', 'gemini-2.5-flash');
+      assert.equal(st.daily_count, 0, 'should NOT count quota on error');
+      assert.ok(st.cooldown_until > Date.now(), 'in-band 429 phải set cooldown (M2)');
+      assert.equal(upstreamCancelled, true, 'reader phải được cancel sau in-band error (M6)');
+    } finally {
+      localServer.close();
+    }
+  });
+
+  it('case 15: GET /v1beta/models trả shape GOOGLE {models:[{name:"models/<id>",...}]}', async () => {
+    const res = await post(port, {}, { path: '/v1beta/models', method: 'GET' });
+    assert.equal(res.status, 200);
+    const json = JSON.parse(res.body);
+    assert.ok(Array.isArray(json.models), 'Google ListModels trả field "models" (không phải {object,data} của OpenAI)');
+    assert.equal(json.models[0].name, 'models/gemini-2.5-flash', 'name phải có prefix "models/"');
+    assert.ok(Array.isArray(json.models[0].supportedGenerationMethods));
+  });
+
+  it('case 16: native stream UTF-8 đa-byte split giữa 2 chunk không bị hỏng (H1) — forward byte nên text phải y nguyên', async () => {
+    const text = 'Xin chào 🌍 — 漢字重慶';
+    const sse = 'data: ' + JSON.stringify({
+      candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3, totalTokenCount: 8 },
+    }) + '\n\n';
+    const bytes = new TextEncoder().encode(sse);
+    const cut = bytes.findIndex((b) => b >= 0x80) + 1;
+    assert.ok(cut > 0 && cut < bytes.length, 'test premise: phải cắt được giữa 1 ký tự UTF-8');
+    const rawStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, cut));
+        controller.enqueue(bytes.slice(cut));
+        controller.close();
+      },
+    });
+    const fakeStreamClient = { callGeminiStream: async () => ({ body: rawStream }) };
+    const localApp = createServer({ models, keys, stateStore: store, config: {}, geminiClient: fakeStreamClient });
+    const localServer = localApp.listen(0);
+    await new Promise((r) => localServer.once('listening', r));
+    try {
+      const res = await postStream(localServer.address().port, {});
+      assert.equal(res.status, 200);
+      // byte được forward nguyên bản -> JSON escape \uXXXX phải giữ nguyên
+      assert.ok(res.body.includes('\\u6f22') || res.body.includes('漢'),
+        'usage parse phải không làm hỏng decode; byte forward phải y nguyên');
+      assert.ok(!res.body.includes('\uFFFD'), 'không được có replacement character');
+      // usageMetadata parse được -> recordSuccess với 8 tokens (không rơi về estimate)
+      const st = store.get('key-1', 'gemini-2.5-flash');
+      assert.equal(st.daily_count, 1, 'stream hoàn tất -> recordSuccess');
+      const tokens = (st.token_timestamps || []).reduce((s, e) => s + (e[1] || 0), 0);
+      assert.equal(tokens, 8, 'usage phải parse được từ event (decode đúng UTF-8)');
     } finally {
       localServer.close();
     }
