@@ -114,4 +114,24 @@ describe('callOpenAI / callOpenAIStream (mock global.fetch, real Response)', () 
     const { value } = await reader.read();
     assert.ok(new TextDecoder().decode(value).includes('[DONE]'));
   });
+
+  it('callOpenAIStream: firstByteMs được truyền xuống fetchSse -> 504 nếu upstream không gửi chunk đầu', async () => {
+    // Không truyền firstByteMs thì sẽ treo hết timeoutMs (60000) rồi mới fail,
+    // khi đó không còn kịp fallback sang model khác.
+    global.fetch = async (url, init) => ({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          init.signal.addEventListener('abort', () => {
+            controller.error(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }));
+          });
+        },
+      }),
+    });
+    const e = await callOpenAIStream(KEY, MODEL, { messages: [], stream: true }, { timeoutMs: 60000, firstByteMs: 120 }).catch((x) => x);
+    assert.ok(e instanceof GeminiError, `expected GeminiError, got ${e && e.name}: ${e && e.message}`);
+    assert.equal(e.status, 504);
+    assert.match(e.message, /first-byte timeout after 120ms/);
+  });
 });

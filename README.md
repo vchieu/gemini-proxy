@@ -76,7 +76,7 @@ npm start
 
 - `config/keys.json` — danh sách key (`id`, `api_key`, `enabled`). **Không nằm trong git** (đã `.gitignore`); tạo từ mẫu `config/keys.example.json`.
 - `config/models.json` — danh sách model (`name`, `priority` càng nhỏ càng ưu tiên, `limits: {rpm, rpd, tpm}`).
-- `config/config.json` — `port`, `host` (**mặc định `127.0.0.1`** — chỉ nghe loopback; set `0.0.0.0` để expose ra LAN, proxy không có auth nên đây là hành động chủ động), `strategy` (`round_robin_key_then_model` mặc định, hoặc `priority_model_first`), `state_file`, `log_level`, `request_timeout_ms`, `max_fallback_attempts`, `respect_agent_model`, `default_cooldown_seconds` (số >= 0 — validate lúc nạp config), `upstream_mode` (**`openai_compat` mặc định** — passthrough body OpenAI gốc tới endpoint OpenAI-compat của Google `/v1beta/openai/chat/completions`, bỏ qua `api/translate.js`; `translate` — legacy, dịch format OpenAI ↔ Gemini native). Override bằng biến môi trường `UPSTREAM_MODE` (ưu tiên hơn config file).
+- `config/config.json` — `port`, `host` (**mặc định `127.0.0.1`** — chỉ nghe loopback; set `0.0.0.0` để expose ra LAN, proxy không có auth nên đây là hành động chủ động), `strategy` (`round_robin_key_then_model` mặc định, hoặc `priority_model_first`), `state_file`, `log_level`, `request_timeout_ms`, `first_byte_timeout_ms` (**mặc định `20000`** — thời gian đợi connect + header + **chunk SSE đầu tiên**; quá hạn thì coi model TREO và fallback sang model khác (504 timeout là lỗi tạm thời), đồng thời **phạt model đó 45s** để các request kế tiếp bỏ qua nó — luôn bị kẹp bởi `request_timeout_ms`; không đặt quá thấp vì model có thinking + prompt dài có thể lâu mới ra chunk đầu), `max_fallback_attempts`, `respect_agent_model`, `default_cooldown_seconds` (số >= 0 — validate lúc nạp config), `upstream_mode` (**`openai_compat` mặc định** — passthrough body OpenAI gốc tới endpoint OpenAI-compat của Google `/v1beta/openai/chat/completions`, bỏ qua `api/translate.js`; `translate` — legacy, dịch format OpenAI ↔ Gemini native). Override bằng biến môi trường `UPSTREAM_MODE` (ưu tiên hơn config file).
 - File state (`state_file`, mặc định `data/state.json`) — ghi atomic (tmp rồi rename) **có retry** khi file bị antivirus/process khác giữ đúng lúc rename trên Windows (lỗi `EPERM: ... rename ...` trước đây làm mất lần ghi đó); retry đồng bộ 3 lần + 1 lần an toàn sau 1s, vẫn fail thì lần ghi ở mutation kế tiếp sẽ bù. File tmp cũ được dọn tự lúc khởi động.
 
 Quota reset ngày tính theo **nửa đêm Pacific Time** (theo Gemini free-tier).
@@ -87,11 +87,13 @@ Quota reset ngày tính theo **nửa đêm Pacific Time** (theo Gemini free-tier
 npm test
 ```
 
-**154/154 test pass** (23 suite) — gồm 36 test cho nhánh `upstream_mode=openai_compat`
+**164/164 test pass** (25 suite) — gồm 36 test cho nhánh `upstream_mode=openai_compat`
 (`tests/configLoader.test.js`, `tests/openaiClient.test.js`, `tests/openaiFallback.test.js`,
 `tests/openaiStreaming.test.js`), 12 test `tests/signatureShim.test.js`, 4 test
 `tests/concurrency.test.js` cho persist bền với Windows EPERM (retry, self-heal, dọn tmp, safety-net)
 và 3 test `tests/abortOnDisconnect.test.js` cho abort upstream khi client ngắt non-stream.
+Kèm 10 test cho timeout byte đầu + circuit breaker theo model (timeout 504 giờ fallback
+sang model khác thay vì treo, request sau không thử lại model đang bị phạt).
 
 ## Tài liệu khác
 

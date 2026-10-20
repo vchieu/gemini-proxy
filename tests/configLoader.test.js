@@ -124,3 +124,35 @@ describe('config/loader host (H2 — mặc định chỉ bind loopback)', () => 
     assert.deepEqual(VALID_UPSTREAM_MODES, ['translate', 'openai_compat']);
   });
 });
+
+describe('config/loader first_byte_timeout_ms (timeout byte đầu -> fallback)', () => {
+  it('defaults to 20000 when absent', () => {
+    const dir = makeTmpConfig({});
+    try {
+      assert.equal(loadConfig(dir).settings.first_byte_timeout_ms, 20000);
+    } finally {
+      rmTmp(dir);
+    }
+  });
+
+  it('accepts explicit first_byte_timeout_ms', () => {
+    const dir = makeTmpConfig({ first_byte_timeout_ms: 30000 });
+    try {
+      assert.equal(loadConfig(dir).settings.first_byte_timeout_ms, 30000);
+    } finally {
+      rmTmp(dir);
+    }
+  });
+
+  it('throws on non-positive or non-number first_byte_timeout_ms', () => {
+    for (const bad of [0, -1, '20000', null]) {
+      const dir = makeTmpConfig({ first_byte_timeout_ms: bad });
+      try {
+        assert.throws(() => loadConfig(dir), /first_byte_timeout_ms must be positive/,
+          `first_byte_timeout_ms=${JSON.stringify(bad)} must throw`);
+      } finally {
+        rmTmp(dir);
+      }
+    }
+  });
+});

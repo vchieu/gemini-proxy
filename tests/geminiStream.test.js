@@ -1,6 +1,16 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { callGeminiStream, Gemini429Error } = require('../client/geminiClient');
+const { callGeminiStream, Gemini429Error, GeminiError } = require('../client/geminiClient');
+
+// Mock stream không gửi chunk nào, nhưng PHẢI error khi bị abort (giống undici
+// thật) — nếu không thì reader.read() treo vô hạn thay vì reject.
+const hangUntilAbort = (signal) => new ReadableStream({
+  start(controller) {
+    signal.addEventListener('abort', () => {
+      controller.error(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }));
+    });
+  },
+});
 
 describe('callGeminiStream (real, mock global.fetch)', () => {
   const originalFetch = global.fetch;
@@ -99,6 +109,42 @@ describe('callGeminiStream (real, mock global.fetch)', () => {
     await assert.rejects(
       () => callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 5000 }),
       (e) => e.name === 'GeminiError' && e.status === 500
+    );
+  });
+
+  it('first-byte timeout: upstream không gửi chunk đầu trong firstByteMs -> GeminiError 504 TRƯỚC khi trả stream', async () => {
+    // Đây là chỗ timeout TRƯỚC đây không fallback được: openStream trả về ngay khi
+    // có header nên tới lúc chunk đầu không tới thì đã quá muộn để chọn cặp khác.
+    global.fetch = async (url, init) => ({ ok: true, status: 200, body: hangUntilAbort(init.signal) });
+
+    const t0 = Date.now();
+    await assert.rejects(
+      () => callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 60000, firstByteMs: 150 }),
+      (e) => e instanceof GeminiError && e.status === 504 && /first-byte timeout after 150ms/.test(e.message)
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed >= 100 && elapsed < 5000,
+      `phải fail theo firstByteMs (~150ms), không được chờ hết timeoutMs 60000ms (thực tế ${elapsed}ms)`);
+  });
+
+  it('idle timeout sau chunk đầu: quá timeoutMs mà không có chunk tiếp -> GeminiError 504 idle timeout', async () => {
+    global.fetch = async (url, init) => ({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"a":1}\n\n')); // chunk đầu tới ngay
+          init.signal.addEventListener('abort', () => {
+            controller.error(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }));
+          });
+        },
+      }),
+    });
+
+    const res = await callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 200, firstByteMs: 60000 });
+    await assert.rejects(
+      async () => { for await (const _chunk of res.body) { /* đọc tới khi stream error */ } },
+      (e) => e instanceof GeminiError && e.status === 504 && /idle timeout after 200ms/.test(e.message)
     );
   });
 });

@@ -41,6 +41,12 @@ class StateStore {
     this._persistDelay = 500; // ms — debounce để tránh sync write mỗi request
     this._persistTimer = null;
     this._retryTimer = null; // safety-net retry sau khi persist fail đủ 3 attempt
+    /**
+     * Circuit breaker theo model — CHỈ RAM, KHÔNG persist (giống inflight):
+     * model -> thời điểm hết phạt (epoch ms). Xem penalizeModel().
+     * @type {Map<string, number>}
+     */
+    this._modelPenalty = new Map();
     if (statePath) this._cleanupStaleTmp();
     if (statePath && fs.existsSync(statePath)) {
       try {
@@ -139,6 +145,39 @@ class StateStore {
     st.inflight_count = Math.max(0, (Number(st.inflight_count) || 0) - 1);
     st.inflight_tokens = Math.max(0, (Number(st.inflight_tokens) || 0) - (Number(estimatedTokens) || 0));
     return st;
+  }
+
+  /**
+   * Circuit breaker theo model (CHỈ RAM, KHÔNG persist): model vừa trả 5xx hoặc
+   * timeout thì bị "phạt" trong `ms` kế tiếp — các request sau BỎ QUA nó thay vì
+   * mất 10-60s thử lại model đang treo (mỗi request mới đều bắt đầu từ model ưu
+   * tiên cao nhất nên không có trí nhớ giữa các request).
+   * @param {string} modelName
+   * @param {number} ms thời gian phạt
+   * @param {number} [nowMs] chỉ để test (mặc định Date.now())
+   */
+  penalizeModel(modelName, ms, nowMs) {
+    const now = nowMs !== undefined ? nowMs : Date.now();
+    this._modelPenalty.set(modelName, now + (Number(ms) || 0));
+  }
+
+  /**
+   * Model có đang bị phạt không? Entry hết hạn bị tự xoá (không tích tụ trong RAM).
+   * @param {string} modelName
+   * @param {number} [nowMs] mặc định Date.now()
+   * @returns {boolean}
+   */
+  isModelPenalized(modelName, nowMs) {
+    const now = nowMs !== undefined ? nowMs : Date.now();
+    const until = this._modelPenalty.get(modelName);
+    if (until === undefined) return false;
+    if (until <= now) { this._modelPenalty.delete(modelName); return false; }
+    return true;
+  }
+
+  /** Gỡ phạt khi model chạy tốt trở lại (gọi khi call thành công). */
+  clearModelPenalty(modelName) {
+    this._modelPenalty.delete(modelName);
   }
 
   /** Dọn các timestamp cũ hơn 60s khỏi mảng (gọi trước khi tính RPM/TPM) */

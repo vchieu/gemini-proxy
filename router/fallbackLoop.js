@@ -33,15 +33,31 @@ function is429(e) {
 
 const TRANSIENT_UPSTREAM_STATUS = new Set([500, 502, 503, 504]);
 
+// Timeout đợi byte đầu (connect + header + chunk SSE đầu) — mặc định của config
+// `first_byte_timeout_ms`. Không đặt quá thấp: model có thinking + prompt dài của
+// Cline/OpenCode có thể lâu mới ra chunk đầu.
+const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 20000;
+
+// Model 5xx/timeout bị bỏ qua trong các request kế tiếp bấy lâu (circuit breaker
+// trong RAM, xem StateStore.penalizeModel). 45s: đủ để model hồi phục sau spike
+// mà request sau không mất 10-60s thử lại nó.
+const MODEL_PENALTY_MS = 45000;
+
 /**
  * HTTP 5xx THẬT từ upstream (Google trả !res.ok) — lỗi tạm thời, nên thử cặp khác.
- * Loại timeout/network của chính proxy ra khỏi nhóm này: geminiClient sinh message
- * "Gemini request timeout..." / "Gemini network error..." nên không match prefix
- * "Gemini error <status>:" (những lỗi đó vẫn trả ngay theo plan §5.5).
+ * Ngoài ra timeout do proxy tự sinh cũng là tạm thời: 504 kèm chữ "timeout"
+ * (connect / first-byte / idle — `Gemini request timeout...`,
+ * `Gemini stream first-byte timeout...`, `Gemini stream idle timeout...`) nghĩa là
+ * model đó TREO, không phải key hỏng -> fallback sang model khác thay vì kẹp request
+ * tới hết timeout rồi để agent retry lại đúng model treo (lệch plan §5.5 — ghi rõ
+ * ở AGENTS.md §6.5).
+ * Loại network của chính proxy ra khỏi nhóm này: message
+ * "Gemini network error..." (status 502) không match -> vẫn trả ngay như plan §5.5.
  */
 function isTransientUpstream(e) {
-  return !!e
-    && TRANSIENT_UPSTREAM_STATUS.has(e.status)
+  if (!e) return false;
+  if (e.status === 504 && typeof e.message === 'string' && /timeout/i.test(e.message)) return true;
+  return TRANSIENT_UPSTREAM_STATUS.has(e.status)
     && typeof e.message === 'string'
     && e.message.startsWith('Gemini error ');
 }
@@ -55,6 +71,14 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   const maxAttempts = (config && config.max_fallback_attempts) || 12;
   const defaultCooldown = (config && config.default_cooldown_seconds) || DEFAULT_COOLDOWN_SECONDS;
   const timeoutMs = (config && config.request_timeout_ms) || 60000;
+  // First-byte timeout (nguyên nhân 1 + 3: timeout không fallback, không có timeout
+  // riêng cho byte đầu): thời gian đợi connect + header + chunk SSE đầu trước khi
+  // coi model TREO và fallback. Kẹp bởi request_timeout_ms để không chờ byte đầu
+  // lâu hơn chính timeout request.
+  const firstByteMs = Math.min(
+    (config && config.first_byte_timeout_ms) || DEFAULT_FIRST_BYTE_TIMEOUT_MS,
+    timeoutMs
+  );
   const mode = (config && config.upstream_mode) || 'openai_compat';
 
   let candidateModels = models;
@@ -81,6 +105,24 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   }
 
   const triedPairs = [];
+  // Circuit breaker (nguyên nhân 2 — không có trí nhớ giữa các request): model bị
+  // phạt từ request TRƯỚC (5xx/timeout) bị loại ngay khỏi danh sách thử của request
+  // này -> request sau vào thẳng model tốt thay vì mất 10-60s thử lại model đang treo.
+  // Nếu model sắp hết hạn phạt thì gỡ ra và thử lại 1 lần (xem nhánh `!pair` dưới).
+  const skipped = [];
+  const now0 = Date.now();
+  const penalizedModels = candidateModels.filter((m) => stateStore.isModelPenalized(m.name, now0));
+  if (penalizedModels.length > 0 && penalizedModels.length < candidateModels.length) {
+    for (const m of penalizedModels) {
+      for (const k of keys) {
+        if (k.enabled === false) continue;
+        const p = { key: k, model: m };
+        triedPairs.push(p);
+        skipped.push(p);
+      }
+    }
+    logger.info(`Bỏ qua ${penalizedModels.length} model đang bị phạt (${MODEL_PENALTY_MS / 1000}s): ${penalizedModels.map((m) => m.name).join(', ')}`);
+  }
   let attempts = 0;
   let lastTransient = null; // lỗi 5xx upstream gần nhất (nếu có)
 
@@ -89,6 +131,19 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
     // select + reserve đồng bộ, không await ở giữa (edge case #3)
     const pair = selectAndReserve(candidateModels, keys, stateStore, now, estimated, triedPairs, config && config.strategy);
     if (!pair) {
+      if (skipped.length > 0) {
+        // Không còn cặp khả dụng trong khi các model bị phạt vẫn đang bị loại -> gỡ
+        // các cặp đó khỏi triedPairs và thử lại ĐÚNG 1 lần (skipped được làm rỗng
+        // ngay đây nên không thể lặp vô hạn). Nhờ vậy: model hết hạn phạt được
+        // thử lại ngay, và mọi model đều bị phạt thì không model nào bị loại
+        // (tránh tự khóa chính mình).
+        const skipSet = new Set(skipped);
+        for (let i = triedPairs.length - 1; i >= 0; i--) {
+          if (skipSet.has(triedPairs[i])) triedPairs.splice(i, 1);
+        }
+        skipped.length = 0;
+        continue;
+      }
       if (lastTransient) {
         // Có lỗi 5xx upstream trong đợt thử này -> trả lỗi 5xx gốc thay vì mask thành 429
         logger.warn(`All pairs failed with transient upstream 5xx: ${lastTransient.message}`);
@@ -102,11 +157,13 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
 
     logger.info(`Attempt ${attempts + 1}: trying key=${pair.key.id} model=${pair.model.name}`);
     try {
-      const ctx = { geminiBody, estimated, timeoutMs, signal: options.signal };
+      const ctx = { geminiBody, estimated, timeoutMs, firstByteMs, signal: options.signal };
       // Case B (xem api/signatureShim.js): dựng lại extra_content từ callsig_… trong id
       // trước khi gửi lên Google, nếu không replay history sẽ bị 400 missing signature.
       if (mode === 'openai_compat') ctx.openAiBody = signatureShim.requestToUpstream(agentRequest);
       const value = await call(pair, ctx);
+      // Model này chạy tốt -> gỡ phạt (nếu có) để các request sau được chọn lại nó
+      stateStore.clearModelPenalty(pair.model.name);
       return { value, pair, estimated, attempts: attempts + 1 };
     } catch (e) {
       stateStore.release(pair.key.id, pair.model.name, estimated);
@@ -134,11 +191,14 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
         throw e;
       }
       if (isTransientUpstream(e)) {
-        // Lệch plan §5.5 (ghi rõ ở AGENTS.md §6.5): 5xx upstream là lỗi tạm thời của
-        // model (overload/spikes) -> fallback sang cặp khác NGAY, không tính quota,
-        // không set cooldown. 5xx theo mình model -> loại hết key của model này trong request này.
+        // Lệch plan §5.5 (ghi rõ ở AGENTS.md §6.5): 5xx upstream VÀ timeout của
+        // proxy là lỗi tạm thời của model (overload/spikes/treo) -> fallback sang
+        // cặp khác NGAY, không tính quota, không set cooldown. Lỗi theo model ->
+        // loại hết key của model này trong request này + phạt model 45s (circuit
+        // breaker) để các request KẾ TIẾP không thử lại model vừa treo.
         logger.warn(`HTTP ${e.status} from key=${pair.key.id} model=${pair.model.name} (transient), thử cặp khác`, { msg: e.message });
         for (const k of keys) if (k.enabled !== false) triedPairs.push({ key: k, model: pair.model });
+        stateStore.penalizeModel(pair.model.name, MODEL_PENALTY_MS);
         lastTransient = e;
         attempts += 1;
         continue;
@@ -199,8 +259,8 @@ async function openStream(agentRequest, deps) {
     (p, ctx) => {
       // Sử ctx.openAiBody nếu có (mode openai_compat), ngược lại dùng geminiBody
       const body = ctx.openAiBody || ctx.geminiBody;
-      if (ctx.openAiBody) return geminiClient.callOpenAIStream(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
-      return geminiClient.callGeminiStream(p.key, p.model, body, { timeoutMs: ctx.timeoutMs });
+      if (ctx.openAiBody) return geminiClient.callOpenAIStream(p.key, p.model, body, { timeoutMs: ctx.timeoutMs, firstByteMs: ctx.firstByteMs });
+      return geminiClient.callGeminiStream(p.key, p.model, body, { timeoutMs: ctx.timeoutMs, firstByteMs: ctx.firstByteMs });
     }
   );
   let released = false;
@@ -248,7 +308,7 @@ async function openNativeStream(requestedModel, geminiBody, deps) {
   const { geminiClient, stateStore } = deps;
   const { value: upstream, pair, estimated } = await withFallback(
     { model: requestedModel }, deps,
-    (p, ctx) => geminiClient.callGeminiStream(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs }),
+    (p, ctx) => geminiClient.callGeminiStream(p.key, p.model, ctx.geminiBody, { timeoutMs: ctx.timeoutMs, firstByteMs: ctx.firstByteMs }),
     { geminiBody }
   );
   let released = false;

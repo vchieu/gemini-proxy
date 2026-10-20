@@ -79,6 +79,10 @@ function loadConfig(configDir) {
     state_file: settingsRaw.state_file || './data/state.json',
     log_level: settingsRaw.log_level || 'info',
     request_timeout_ms: settingsRaw.request_timeout_ms !== undefined ? settingsRaw.request_timeout_ms : 60000,
+    // Timeout đợi connect + header + chunk SSE đầu tiên trước khi coi model treo
+    // (rồi fallback). Không đặt quá thấp: model có thinking + prompt dài có thể
+    // lâu mới ra chunk đầu. Luôn bị kẹp bởi request_timeout_ms lúc dùng.
+    first_byte_timeout_ms: settingsRaw.first_byte_timeout_ms !== undefined ? settingsRaw.first_byte_timeout_ms : 20000,
     max_fallback_attempts: settingsRaw.max_fallback_attempts !== undefined ? settingsRaw.max_fallback_attempts : 12,
     respect_agent_model: settingsRaw.respect_agent_model === true,
     default_cooldown_seconds: settingsRaw.default_cooldown_seconds !== undefined ? settingsRaw.default_cooldown_seconds : 30,
@@ -98,6 +102,9 @@ function loadConfig(configDir) {
   }
   if (typeof settings.request_timeout_ms !== 'number' || !(settings.request_timeout_ms > 0)) {
     throw new Error('config.json: request_timeout_ms must be positive');
+  }
+  if (typeof settings.first_byte_timeout_ms !== 'number' || !(settings.first_byte_timeout_ms > 0)) {
+    throw new Error('config.json: first_byte_timeout_ms must be positive');
   }
   if (typeof settings.max_fallback_attempts !== 'number' || !(settings.max_fallback_attempts >= 1)) {
     throw new Error('config.json: max_fallback_attempts must be >= 1');

@@ -22,7 +22,7 @@ agent → api/server.js → router/fallbackLoop.js → router/selector.js
   → [upstream_mode=translate]     client/geminiClient.js → Google generateContent
   → [upstream_mode=openai_compat] client/geminiClient.js → Google /v1beta/openai/chat/completions
   → 429? client/errorParser.js → store.setCooldown → chọn cặp khác (loop)
-  → 5xx upstream (500/502/503/504)? → chọn cặp khác NGAY (KHÔNG cooldown, KHÔNG tính quota)
+  → 5xx upstream (500/502/503/504) hoặc timeout của proxy (504 "...timeout...")? → chọn cặp khác NGAY (KHÔNG cooldown, KHÔNG tính quota; phạt model 45s — xem §5.5)
   → thành công? store.recordSuccess → [translate] api/translate.js → trả OpenAI format
                                  ↘ [openai_compat] trả nguyên payload Google
 ```
@@ -48,9 +48,9 @@ agent → POST /v1/chat/completions (stream: true)
 | State Store | `state/store.js` | `class StateStore`: `get(k,m)`, `recordSuccess(k,m,tokens)`, `setCooldown(k,m,ts)`, `pruneOldEntries(st,now)`, `persist()` (atomic write qua .tmp + rename; lược bỏ inflight — transient), `reserve(k,m,est)`, `release(k,m,est)`, `resetDailyIfNeeded(k,m,now)`, `minCooldownRemaining(now)`, `snapshot()`, `flush()` (huỷ debounce + persist, dùng khi SIGINT/SIGTERM) |
 | Cooldown | `state/cooldown.js` | `isAvailable(pairState, limits, nowMs, estimatedTokens) → boolean` (THUẦN, không mutate pairState; cộng `inflight_count`/`inflight_tokens` vào RPD/RPM/TPM — edge case #3). Reset daily_count gọi riêng qua `StateStore.resetDailyIfNeeded(k,m,now)` |
 | Selector | `router/selector.js` | `selectPair(..., strategy?)` (thuần, không side-effect; `strategy: 'round_robin_key_then_model' \| 'priority_model_first'`) + `selectAndReserve(..., strategy?)` (select + `reserve` nguyên tử, caller BẮT BUỘC `release` mọi nhánh kết thúc) → `SelectedPair \| null` (+ `_resetRoundRobin()` chỉ dùng cho test) |
-| Fallback | `router/fallbackLoop.js` | `handleRequest(...)`, `openStream(...)`, `handleNativeRequest(...)`, `openNativeStream(...)`, `class Aggregated429Error`; **rẽ nhánh theo `config.upstream_mode`**: `translate` → `callGemini` + `openAiToGemini`/`geminiToOpenAi`; `openai_compat` → `callOpenAI`/`callOpenAIStream` (body OpenAI nguyên bản, chỉ đổi `model`); chính sách fallback: **429** → set cooldown theo retryDelay, **HTTP 5xx upstream (500/502/503/504)** → fallback ngay không cooldown (xem §5), lỗi khác trả ngay |
+| Fallback | `router/fallbackLoop.js` | `handleRequest(...)`, `openStream(...)`, `handleNativeRequest(...)`, `openNativeStream(...)`, `class Aggregated429Error`; **rẽ nhánh theo `config.upstream_mode`**: `translate` → `callGemini` + `openAiToGemini`/`geminiToOpenAi`; `openai_compat` → `callOpenAI`/`callOpenAIStream` (body OpenAI nguyên bản, chỉ đổi `model`); chính sách fallback: **429** → set cooldown theo retryDelay, **HTTP 5xx upstream (500/502/503/504)** và **timeout của proxy (504 có chữ "timeout")** → fallback ngay không cooldown, kèm **phạt model 45s (circuit breaker RAM-only)** (xem §5.5), lỗi khác (4xx, network 502) trả ngay |
 | Gemini Native | `api/geminiNative.js` | `createGeminiNativeRouter(deps) → express.Router`; mount tại `/v1beta` (xem `api/server.js`); `POST /models/:modelAction` (generateContent / streamGenerateContent), `GET /models`; **passthrough**: không dịch format, stream forward byte SSE nguyên bản + **`res.end()` bắt buộc khi stream xong** (thiếu → client treo vô hạn), không ghi `[DONE]`; lỗi trả theo format Google `{ error: { code, message, status } }` (giữ nguyên body Google nếu có) |
-| Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)`, **`callOpenAI(key, model, openAiBody, {timeoutMs?})`**, **`callOpenAIStream(...)`** (endpoint OpenAI-compat `/v1beta/openai/chat/completions`, `Authorization: Bearer`); trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc); idle timeout cover cả stream body; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError`; lỗi HTTP dựng qua helper `buildHttpError(status, text)` — **body đọc đúng 1 lần ở caller** rồi truyền `text`, hiểu cả body JSON mảng `[{error:{...}}]`; 429 hoặc 403 có message quota/rate/limit/retry → `Gemini429Error` (kèm `retryDelaySeconds`), còn lại → `GeminiError("Gemini error <status>: ...")`; **`GeminiError.body` là JSON Google đã parse** (hoặc `undefined` nếu không phải JSON object) |
+| Gemini Client | `client/geminiClient.js` | `callGemini(key, model, geminiBody, {timeoutMs?})`, `callGeminiStream(...)`, **`callOpenAI(key, model, openAiBody, {timeoutMs?})`**, **`callOpenAIStream(..., {timeoutMs?, firstByteMs?})`** (endpoint OpenAI-compat `/v1beta/openai/chat/completions`, `Authorization: Bearer`); trả **object mới** `{ ok, status, headers, body }` (không phải `Response` gốc); timeout 2 giai đoạn trong `fetchSse(doFetch, timeoutMs, firstByteMs?)`: **đọc sẵn chunk SSE đầu** dưới timer first-byte (quá hạn → `GeminiError 504 "first-byte timeout"` TRƯỚC khi `openStream` trả pair → còn kịp fallback, xem §5.5) rồi idle timeout reset mỗi chunk; `class Gemini429Error` (có `.rawMessage`, `.details`, `.retryDelaySeconds`), `class GeminiError`; lỗi HTTP dựng qua helper `buildHttpError(status, text)` — **body đọc đúng 1 lần ở caller** rồi truyền `text`, hiểu cả body JSON mảng `[{error:{...}}]`; 429 hoặc 403 có message quota/rate/limit/retry → `Gemini429Error` (kèm `retryDelaySeconds`), còn lại → `GeminiError("Gemini error <status>: ...")`; **`GeminiError.body` là JSON Google đã parse** (hoặc `undefined` nếu không phải JSON object) |
 | Error Parser | `client/errorParser.js` | `extractRetryDelaySeconds(body) → number` (giây; fallback `DEFAULT_COOLDOWN_SECONDS = 30`) |
 | API Layer | `api/server.js` | `createServer({ models, keys, stateStore, config, geminiClient? }) → Express app`; mount router Gemini-native tại `/v1beta` — route `POST /v1beta/models/:modelAction`, `GET /v1beta/models`; **rẽ nhánh `upstream_mode`**: `translate` → `handleRequest` + defer thoughtSignature, `openai_compat` → `streamOpenAiPassthrough` (stream) / `handleRequest` bỏ qua `translate` (non-stream); che `key=` trong access log |
 | OpenAI Passthrough | `api/openaiPassthrough.js` | `streamOpenAiPassthrough({ req, res, handle, agentRequest, deps, sendError, errorToOpenAi })` — stream SSE ở mức event cho `upstream_mode=openai_compat`: gom event `data:` đúng spec, forward payload **gốc** (không parse→stringify lại), lọc chunk usage-only `choices:[]` khi agent không xin `stream_options.include_usage`, tự ghi `[DONE]` nếu upstream thiếu; mọi nhánh `release()` đúng 1 lần + luôn `res.end()`; client ngắt → `reader.cancel()`, không `recordSuccess`, không `[DONE]`; không `require` `api/server.js` (tránh vòng) |
@@ -188,14 +188,27 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
    `gemini-3.8-flash` trả 503 "high demand" lặp lại dù 3 model khác vẫn chạy được) nên
    `withFallback` fallback sang cặp khác **ngay** (loại hết key của model 5xx trong
    request đó), không tính quota, không set cooldown; hết cặp còn 5xx thì trả lỗi 5xx gốc.
-   Timeout/network của proxy và mọi lỗi 4xx vẫn trả ngay như spec. (Xem `AGENTS.md` §6.5.)
+   **Lệch spec 2 (timeout — sửa sau khi xem log 16/10):** trước đây timeout của proxy
+   (504) "trả ngay" như spec, nhưng log cho thấy request treo hết `request_timeout_ms`
+   rồi chết (`Gemini stream timeout after 60000ms` → `504 60xxx ms`), agent retry và
+   lại chọn đúng model đang treo; mỗi request mới còn bắt đầu lại từ model ưu tiên cao
+   nhất nên không có trí nhớ giữa các request (503 chỉ loại model trong request đó).
+   Vì vậy: (a) **mọi 504 có chữ "timeout"** (connect / first-byte / idle) cũng fallback
+   như 5xx — KHÔNG cooldown, KHÔNG tính quota; (b) thêm **timeout byte đầu riêng**
+   `first_byte_timeout_ms` (mặc định 20s, xem §6) — `fetchSse` đọc sẵn chunk SSE đầu
+   trước khi `openStream` trả pair nên còn kịp fallback; (c) thêm **circuit breaker theo
+   model trong RAM** — model vừa 5xx/timeout bị phạt 45s (`StateStore.penalizeModel`),
+   các request kế tiếp bỏ qua nó, model chạy tốt thì `clearModelPenalty`.
+   Network của proxy (`Gemini network error...`) và mọi lỗi 4xx vẫn trả ngay như spec.
+   (Xem `AGENTS.md` §6.5.)
 6. **`respect_agent_model=true`** mới tôn trọng model agent gửi; mặc định `false`.
 7. **Streaming:**
    - Kiểm tra limit **trước** khi mở stream.
    - Fallback 429 trước khi gửi byte đầu.
    - 429 giữa stream → đóng stream kèm lỗi (không retry ngầm).
    - Client disconnect → KHÔNG recordSuccess, KHÔNG ghi `[DONE]`.
-   - Timeout cover cả stream body (idle timeout).
+   - Timeout cover cả stream body (idle timeout) + **timeout byte đầu riêng**
+     (`first_byte_timeout_ms`, mặc định 20s) — xem §5.5, lỗi 504 này vẫn kịp fallback.
 8. **Shutdown** — SIGINT/SIGTERM → `flush()` (huỷ debounce + persist) trước khi exit.
 
 ## 6. Cấu hình
@@ -230,6 +243,7 @@ throw Aggregated429Error("Đã thử hết số lần fallback")
   "state_file": "./data/state.json",
   "log_level": "info",
   "request_timeout_ms": 60000,
+  "first_byte_timeout_ms": 20000,
   "max_fallback_attempts": 12,
   "respect_agent_model": false,
   "default_cooldown_seconds": 30,

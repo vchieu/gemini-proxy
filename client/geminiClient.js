@@ -209,39 +209,55 @@ async function callOpenAI(key, model, openAiBody, options = {}) {
  * 2 hàm này chỉ khác nhau ở URL + header + body, toàn bộ phần timeout/wrap stream
  * giống hệt nhau (trước đây bị copy-paste ~50 dòng).
  *
- * - Timeout bao trùm cả lúc kết nối, lúc đọc body lỗi và cả lúc đọc stream body
- *   (idle timeout reset mỗi chunk) — không chỉ lúc mở kết nối.
+ * - `firstByteMs` (mặc định = `timeoutMs`): phủ connect + header + **chunk SSE đầu
+ *   tiên**. Hàm ĐỌC TRƯỚC chunk đầu trước khi trả về, nên upstream treo trước byte
+ *   đầu thì ném lỗi NGAY tại đây — `openStream` chưa trả pair -> `withFallback`
+ *   kịp fallback sang model khác. (Trước đây trả về ngay khi có header, tới khi
+ *   chunk đầu không tới thì đã quá muộn để fallback: request treo hết timeout rồi
+ *   chết, agent retry lại đúng model đang treo.)
+ * - `timeoutMs`: idle timeout tính từ sau chunk đầu, reset mỗi chunk (giữ nguyên),
+ *   áp dụng cả lúc đọc body lỗi.
  * - Đọc body lỗi ĐÚNG 1 LẦN rồi giao cho `buildHttpError` (Q3: hỗ trợ body mảng).
  * - Trả object MỚI bọc ReadableStream — KHÔNG gán `res.body`
  *   (Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng).
  *
  * @param {(signal: AbortSignal) => Promise<Response>} doFetch
- * @param {number} timeoutMs
+ * @param {number} timeoutMs  // idle timeout sau chunk đầu tiên
+ * @param {number} [firstByteMs]  // timeout connect + header + chunk đầu (mặc định = timeoutMs)
  * @returns {Promise<{ ok: boolean, status: number, headers: object, body: ReadableStream }>}
  */
-async function fetchSse(doFetch, timeoutMs) {
+async function fetchSse(doFetch, timeoutMs, firstByteMs) {
+  const fbMs = Number(firstByteMs) > 0 ? Number(firstByteMs) : timeoutMs;
   const controller = new AbortController();
   let timedOut = false;
+  let phase = 'first-byte'; // đổi sang 'idle' sau khi đã đọc được chunk đầu tiên
   const onTimeout = () => { timedOut = true; controller.abort(); };
-  let timer = setTimeout(onTimeout, timeoutMs);
+  let timer = setTimeout(onTimeout, fbMs);
+  const timeoutError = () => new GeminiError(
+    phase === 'first-byte'
+      ? `Gemini stream first-byte timeout after ${fbMs}ms`
+      : `Gemini stream idle timeout after ${timeoutMs}ms`,
+    { status: 504 }
+  );
 
   let res;
   try {
     res = await doFetch(controller.signal);
   } catch (e) {
     clearTimeout(timer);
-    if (timedOut || e.name === 'AbortError') throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
+    if (timedOut || e.name === 'AbortError') throw timeoutError();
     throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
   }
 
   if (!res.ok) {
+    if (timedOut) { clearTimeout(timer); throw timeoutError(); }
     let text = '';
     try {
       text = await res.text();
     } catch (e) {
       if (timedOut || e.name === 'AbortError') {
         clearTimeout(timer);
-        throw new GeminiError(`Gemini stream timeout after ${timeoutMs}ms`, { status: 504 });
+        throw timeoutError();
       }
       logger.warn(`Cannot read error body (HTTP ${res.status}): ${e.message}`);
     }
@@ -249,22 +265,40 @@ async function fetchSse(doFetch, timeoutMs) {
     throw buildHttpError(res.status, text);
   }
 
+  if (timedOut) { clearTimeout(timer); throw timeoutError(); }
+
+  // Đọc TRƯỚC chunk đầu dưới timer firstByteMs — điểm then chốt để kịp fallback:
+  // nếu upstream treo ở đây thì lỗi ném ra TRƯỚC khi openStream trả pair.
   const reader = res.body.getReader();
+  let first;
+  try {
+    first = await reader.read();
+  } catch (e) {
+    clearTimeout(timer);
+    if (timedOut || e.name === 'AbortError') throw timeoutError();
+    throw new GeminiError(`Gemini network error: ${e.message}`, { status: 502 });
+  }
+  clearTimeout(timer);
+  phase = 'idle';
+  timer = setTimeout(onTimeout, timeoutMs);
+
   const resetIdle = () => {
     if (timedOut) return;
     clearTimeout(timer);
     timer = setTimeout(onTimeout, timeoutMs);
   };
+  let pendingFirst = first; // chunk đọc sẵn — trả lại ở lần pull đầu tiên
   const wrapped = new ReadableStream({
     async pull(ctrl) {
       try {
-        const { done, value } = await reader.read();
+        const { done, value } = pendingFirst || await reader.read();
+        pendingFirst = null;
         if (done) { clearTimeout(timer); ctrl.close(); return; }
         resetIdle();
         ctrl.enqueue(value);
       } catch (err) {
         clearTimeout(timer);
-        ctrl.error(timedOut ? new GeminiError(`Gemini stream idle timeout after ${timeoutMs}ms`, { status: 504 }) : err);
+        ctrl.error(timedOut ? timeoutError() : err);
       }
     },
     cancel(reason) {
@@ -282,7 +316,8 @@ async function fetchSse(doFetch, timeoutMs) {
  * @param {ApiKeyConfig} key
  * @param {ModelConfig} model
  * @param {object} openAiBody  // format OpenAI chat-completions
- * @param {{timeoutMs?: number}} options
+ * @param {{timeoutMs?: number, firstByteMs?: number}} options
+ *   firstByteMs: thời gian đợi connect + header + chunk SSE đầu (mặc định = timeoutMs)
  * @returns {Promise<{ ok: boolean, status: number, headers: object, body: ReadableStream }>}
  */
 async function callOpenAIStream(key, model, openAiBody, options = {}) {
@@ -296,7 +331,7 @@ async function callOpenAIStream(key, model, openAiBody, options = {}) {
     },
     body: JSON.stringify(body),
     signal,
-  }), timeoutMs);
+  }), timeoutMs, options.firstByteMs);
 }
 
 /**
@@ -320,8 +355,11 @@ function buildOpenAiBody(body, model, stream) {
 }
 
 /**
- * Gọi Gemini streaming (SSE). Trả về object mới bọc stream, reset idle timeout mỗi chunk.
+ * Gọi Gemini streaming (SSE). Trả về object mới bọc stream — đọc sẵn chunk đầu
+ * (first-byte timeout) rồi reset idle timeout mỗi chunk.
  * KHÔNG trả Response gốc vì Response.body của undici chỉ có getter -> gán bị bỏ qua im lặng.
+ * @param {{timeoutMs?: number, firstByteMs?: number}} options — firstByteMs: thời gian
+ *   đợi connect + header + chunk SSE đầu (mặc định = timeoutMs)
  * @returns {Promise<{ ok: boolean, status: number, headers: object, body: ReadableStream }>}
  */
 async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
@@ -331,7 +369,7 @@ async function callGeminiStream(key, model, geminiRequestBody, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(geminiRequestBody),
     signal,
-  }), timeoutMs);
+  }), timeoutMs, options.firstByteMs);
 }
 
 module.exports = { callGemini, callGeminiStream, callOpenAI, callOpenAIStream, Gemini429Error, GeminiError, buildHttpError };
