@@ -87,7 +87,7 @@ Quota reset ngày tính theo **nửa đêm Pacific Time** (theo Gemini free-tier
 npm test
 ```
 
-**164/164 test pass** (25 suite) — gồm 36 test cho nhánh `upstream_mode=openai_compat`
+**170/170 test pass** (26 suite) — gồm 36 test cho nhánh `upstream_mode=openai_compat`
 (`tests/configLoader.test.js`, `tests/openaiClient.test.js`, `tests/openaiFallback.test.js`,
 `tests/openaiStreaming.test.js`), 12 test `tests/signatureShim.test.js`, 4 test
 `tests/concurrency.test.js` cho persist bền với Windows EPERM (retry, self-heal, dọn tmp, safety-net)

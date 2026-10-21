@@ -117,6 +117,53 @@ function buildHttpError(status, text) {
 }
 
 /**
+ * Detect lỗi in-band trong 1 chunk SSE: Google đôi khi mở stream HTTP 200 rồi gửi
+ * JSON lỗi ngay trong chunk đầu (`data: {"error":{"code":503,"message":"...high
+ * demand"}}`, hoặc mảng `[{error:{...}}]` — log 16/10 có "Native stream error in
+ * chunk: ... high demand" rồi `-> 200 32298ms`). Nếu không bắt ở đây thì lỗi bị
+ * forward mid-stream: client nhận lỗi giữa chừng và request tốn nguyên một key/model
+ * mà không ai fallback.
+ * Chỉ bóc event `data:` ĐẦU TIÊN của chunk (không cần parser SSE đầy đủ) — nếu
+ * parse được và có `error` object thì dựng lỗi bằng `buildHttpError(status, text)`
+ * để lỗi đi vào đúng nhánh fallback/cooldown của `withFallback`. Decode chỉ để
+ * detect: chunk thật vẫn được forward nguyên bytes (kể cả khi decode riêng lẻ
+ * hỏng multibyte bị cắt — khi đó JSON.parse fail → null → giữ hành vi pass-through).
+ * @param {Uint8Array} [value]
+ * @returns {Gemini429Error|GeminiError|null}
+ */
+function inbandErrorFromChunk(value) {
+  if (!value || !value.byteLength) return null;
+  const text = new TextDecoder('utf-8').decode(value);
+  const m = /^[ \t]*data:[ \t]?(.*)$/m.exec(text);
+  if (!m) return null;
+  const payload = m[1].trim();
+  if (!payload || payload === '[DONE]') return null;
+  let parsed;
+  try { parsed = JSON.parse(payload); } catch (_) { return null; }
+  if (Array.isArray(parsed)) {
+    const first = parsed.find((p) => p && p.error && typeof p.error === 'object');
+    if (!first) return null;
+    return buildHttpError(inbandErrorStatus(first.error), payload);
+  }
+  if (parsed && parsed.error && typeof parsed.error === 'object') {
+    return buildHttpError(inbandErrorStatus(parsed.error), payload);
+  }
+  return null;
+}
+
+/**
+ * Status cho lỗi in-band: ưu tiên `error.code` số trong dải 4xx/5xx; không có thì
+ * suy từ message (khớp QUOTA_RE → 429 để vào nhánh cooldown); còn lại mặc định
+ * 503 — in-band error ở chunk đầu nghĩa là cặp này fail, tạm thời và nên thử cặp khác.
+ */
+function inbandErrorStatus(errObj) {
+  const code = Number(errObj.code);
+  if (Number.isInteger(code) && code >= 400 && code <= 599) return code;
+  if (typeof errObj.message === 'string' && QUOTA_RE.test(errObj.message)) return 429;
+  return 503;
+}
+
+/**
  * Gọi Gemini generateContent API với 1 key + model cụ thể.
  * @param {ApiKeyConfig} key
  * @param {ModelConfig} model
@@ -281,6 +328,17 @@ async function fetchSse(doFetch, timeoutMs, firstByteMs) {
   clearTimeout(timer);
   phase = 'idle';
   timer = setTimeout(onTimeout, timeoutMs);
+
+  // Lỗi in-band ở CHUNK ĐẦU (Google mở 200 rồi gửi JSON lỗi ngay) — bắt ngay tại đây
+  // để nó đi vào đúng nhánh fallback/cooldown của withFallback, thay vì bị forward
+  // mid-stream cho client nhận lỗi giữa chừng. Vẫn còn kịp vì openStream CHƯA trả pair.
+  const inbandError = inbandErrorFromChunk(first.done ? undefined : first.value);
+  if (inbandError) {
+    clearTimeout(timer);
+    controller.abort();
+    reader.cancel().catch(() => {}); // M6: huỷ kết nối upstream, không để treo tới idle timeout
+    throw inbandError;
+  }
 
   const resetIdle = () => {
     if (timedOut) return;

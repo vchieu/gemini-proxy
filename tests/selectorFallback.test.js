@@ -1,8 +1,8 @@
-const { describe, it, beforeEach } = require('node:test');
+const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { StateStore } = require('../state/store');
 const { selectPair, _resetRoundRobin } = require('../router/selector');
-const { handleRequest } = require('../router/fallbackLoop');
+const { handleRequest, openStream } = require('../router/fallbackLoop');
 const { Gemini429Error, GeminiError } = require('../client/geminiClient');
 
 function makeModels() {
@@ -181,6 +181,69 @@ describe('fallbackLoop integration (transient upstream 5xx -> fallback)', () => 
       () => handleRequest({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, { models, keys, stateStore: store, geminiClient: fakeClient, config: { upstream_mode: 'translate', max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 } }),
       (e) => e.status === 504 && /timeout/i.test(e.message)
     );
+  });
+});
+
+describe('in-band error ở chunk đầu stream (HTTP 200 + JSON lỗi) -> fallback thật', () => {
+  beforeEach(() => _resetRoundRobin());
+  const realClient = require('../client/geminiClient');
+  const originalFetch = global.fetch;
+  afterEach(() => { global.fetch = originalFetch; });
+
+  const sseChunk = (obj) => new TextEncoder().encode('data: ' + JSON.stringify(obj) + '\n\n');
+  const errorFirstChunk = (errorObj) => async () => ({
+    ok: true,
+    status: 200,
+    body: new ReadableStream({
+      start(controller) { controller.enqueue(sseChunk(errorObj)); controller.close(); },
+    }),
+  });
+  const okStream = async () => ({
+    ok: true,
+    status: 200,
+    body: new ReadableStream({
+      start(controller) { controller.enqueue(sseChunk({ candidates: [{ content: { parts: [{ text: 'hello' }] }, finishReason: 'STOP' }] })); controller.close(); },
+    }),
+  });
+
+  it('503 in-band chunk đầu model A -> openStream fallback model B, phạt model A, không cooldown', async () => {
+    const store = new StateStore(null);
+    const deps = {
+      models: makeModels(), keys: makeKeys(), stateStore: store, geminiClient: realClient,
+      config: { upstream_mode: 'translate', max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 },
+    };
+    global.fetch = async (url) => (url.includes('gemini-2.5-flash-lite') ? okStream() : errorFirstChunk({ error: { code: 503, message: 'The model is currently experiencing high demand.' } })());
+
+    const h = await openStream({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, deps);
+    assert.equal(h.pair.model.name, 'gemini-2.5-flash-lite');
+    h.release();
+    // 503 in-band = transient -> phạt model A (circuit breaker), KHÔNG cooldown, KHÔNG tính quota
+    assert.ok(store.isModelPenalized('gemini-2.5-flash'));
+    for (const k of makeKeys()) {
+      const st = store.get(k.id, 'gemini-2.5-flash');
+      assert.ok(!(st.cooldown_until > Date.now()), '503 không được set cooldown');
+      assert.equal(st.daily_count, 0, '503 không được tính quota');
+    }
+  });
+
+  it('429 in-band chunk đầu model A -> set cooldown cặp (key,model) A rồi fallback model B', async () => {
+    const store = new StateStore(null);
+    const deps = {
+      models: makeModels(), keys: makeKeys(), stateStore: store, geminiClient: realClient,
+      config: { upstream_mode: 'translate', max_fallback_attempts: 6, request_timeout_ms: 5000, default_cooldown_seconds: 30 },
+    };
+    global.fetch = async (url) => (url.includes('gemini-2.5-flash-lite')
+      ? okStream()
+      : errorFirstChunk({ error: { code: 429, message: 'Please retry in 5s.', details: [{ retryDelay: '5s' }] } })());
+
+    const h = await openStream({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, deps);
+    assert.equal(h.pair.model.name, 'gemini-2.5-flash-lite');
+    h.release();
+    // 429 in-band = quota -> cooldown cặp A (retryDelay 5s), KHÔNG phạt model (429 là quota, không phải treo)
+    for (const k of makeKeys()) {
+      assert.ok(store.get(k.id, 'gemini-2.5-flash').cooldown_until > Date.now(), '429 in-band phải set cooldown cho cặp A');
+    }
+    assert.ok(!store.isModelPenalized('gemini-2.5-flash'), '429 không thuộc circuit breaker (không phạt model)');
   });
 });
 

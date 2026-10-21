@@ -147,4 +147,61 @@ describe('callGeminiStream (real, mock global.fetch)', () => {
       (e) => e instanceof GeminiError && e.status === 504 && /idle timeout after 200ms/.test(e.message)
     );
   });
+
+  // Google mở stream 200 rồi chunk đầu CHÍNH LÀ JSON lỗi (log 16/10:
+  // "Native stream error in chunk: ... high demand" -> 200 32298ms). Nếu fetchSse
+  // trả nguyên chunk này cho caller thì client nhận lỗi mid-stream, không ai fallback.
+  const okAndErrorFirstChunk = (errorObj) => async () => ({
+    ok: true,
+    status: 200,
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify(errorObj) + '\n\n'));
+        controller.close();
+      },
+    }),
+  });
+
+  it('in-band 503 ở chunk đầu (HTTP 200) -> ném GeminiError 503 TRƯỚC khi trả stream', async () => {
+    global.fetch = okAndErrorFirstChunk({ error: { code: 503, message: 'The model is currently experiencing high demand.', status: 'UNAVAILABLE' } });
+    await assert.rejects(
+      () => callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 5000 }),
+      (e) => e instanceof GeminiError && e.status === 503 && /Gemini error 503/.test(e.message) && /high demand/.test(e.message)
+    );
+  });
+
+  it('in-band 429 ở chunk đầu (HTTP 200) -> ném Gemini429Error (có retryDelaySeconds)', async () => {
+    global.fetch = okAndErrorFirstChunk({ error: { code: 429, message: 'Please retry in 5s.', details: [{ retryDelay: '5s' }] } });
+    await assert.rejects(
+      () => callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 5000 }),
+      (e) => e instanceof Gemini429Error && e.status === 429 && e.retryDelaySeconds === 5
+    );
+  });
+
+  it('in-band error dạng mảng [{error:{...}}] ở chunk đầu -> cũng ném lỗi', async () => {
+    global.fetch = okAndErrorFirstChunk([{ error: { code: 503, message: 'overloaded' } }]);
+    await assert.rejects(
+      () => callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 5000 }),
+      (e) => e instanceof GeminiError && e.status === 503
+    );
+  });
+
+  it('KHÔNG ném khi error nằm SAU chunk đầu bình thường (mid-stream error giữ nguyên hành vi)', async () => {
+    global.fetch = async () => ({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"x"}}]}\n\n'));
+          controller.enqueue(new TextEncoder().encode('data: {"error":{"code":503,"message":"late error"}}\n\n'));
+          controller.close();
+        },
+      }),
+    });
+    const res = await callGeminiStream({ api_key: 'k1' }, { name: 'm' }, {}, { timeoutMs: 5000 });
+    let text = '';
+    for await (const chunk of res.body) text += Buffer.from(chunk).toString('utf8');
+    assert.ok(text.includes('"x"'), 'chunk đầu phải được forward bình thường');
+    assert.ok(text.includes('late error'), 'error mid-stream vẫn được forward (xử lý ở router)');
+  });
 });
