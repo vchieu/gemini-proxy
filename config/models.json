@@ -19,6 +19,11 @@
       "name": "gemini-3.5-flash",
       "priority": 4,
       "limits": { "rpm": 5, "rpd": 20, "tpm": 250000 }
+    },
+    {
+      "name": "gemini-3.5-flash-lite",
+      "priority": 4,
+      "limits": { "rpm": 15, "rpd": 500, "tpm": 250000 }
     }
   ]
 }

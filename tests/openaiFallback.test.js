@@ -372,4 +372,46 @@ describe('fallbackLoop upstream_mode=openai_compat', () => {
     assert.ok(observedInflightTokens > messagesOnly,
       `tools schema must be counted: inflight=${observedInflightTokens} vs messagesOnly=${messagesOnly}`);
   });
+
+  it('respect_agent_model: true rotates ONLY requested model (e.g., model "b")', async () => {
+    const calls = [];
+    const deps = makeDeps({
+      config: { respect_agent_model: true },
+      client: {
+        callOpenAI: async (key, model) => {
+          calls.push(model.name);
+          if (model.name === 'b') {
+            throw new Gemini429Error('retry in 5s', { retryDelaySeconds: 5 });
+          }
+          return OPENAI_OK;
+        },
+      },
+    });
+
+    const specificReq = { model: 'b', messages: [{ role: 'user', content: 'hi' }] };
+    const err = await handleRequest(specificReq, deps).catch((e) => e);
+
+    assert.ok(err instanceof Aggregated429Error, 'should throw Aggregated429Error when model b is exhausted');
+    assert.deepEqual(calls, ['b'], 'should ONLY call model b, model a must not be touched');
+    assert.equal(deps.stateStore.get('key-1', 'a').daily_count, 0, 'model a was not called');
+  });
+
+  it('respect_agent_model: unknown model logs warning and falls back to rotating all models', async () => {
+    const calls = [];
+    const deps = makeDeps({
+      config: { respect_agent_model: true },
+      client: {
+        callOpenAI: async (key, model) => {
+          calls.push(model.name);
+          return OPENAI_OK;
+        },
+      },
+    });
+
+    const unknownReq = { model: 'unknown-model', messages: [{ role: 'user', content: 'hi' }] };
+    const out = await handleRequest(unknownReq, deps);
+
+    assert.deepEqual(calls, ['a'], 'should fall back to rotating candidate models (starts with priority 1 model a)');
+    assert.equal(out.usedModel, 'a');
+  });
 });

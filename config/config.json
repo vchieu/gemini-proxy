@@ -7,7 +7,7 @@
   "request_timeout_ms": 60000,
   "first_byte_timeout_ms": 20000,
   "max_fallback_attempts": 12,
-  "respect_agent_model": false,
+  "respect_agent_model": true,
   "default_cooldown_seconds": 30,
   "upstream_mode": "openai_compat"
 }

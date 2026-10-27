@@ -84,7 +84,7 @@ function loadConfig(configDir) {
     // lâu mới ra chunk đầu. Luôn bị kẹp bởi request_timeout_ms lúc dùng.
     first_byte_timeout_ms: settingsRaw.first_byte_timeout_ms !== undefined ? settingsRaw.first_byte_timeout_ms : 20000,
     max_fallback_attempts: settingsRaw.max_fallback_attempts !== undefined ? settingsRaw.max_fallback_attempts : 12,
-    respect_agent_model: settingsRaw.respect_agent_model === true,
+    respect_agent_model: settingsRaw.respect_agent_model !== false,
     default_cooldown_seconds: settingsRaw.default_cooldown_seconds !== undefined ? settingsRaw.default_cooldown_seconds : 30,
     upstream_mode: (process.env.UPSTREAM_MODE || settingsRaw.upstream_mode || 'openai_compat').trim(),
   };

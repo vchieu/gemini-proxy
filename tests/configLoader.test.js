@@ -156,3 +156,32 @@ describe('config/loader first_byte_timeout_ms (timeout byte đầu -> fallback)'
     }
   });
 });
+
+describe('config/loader respect_agent_model', () => {
+  it('defaults respect_agent_model to true when absent', () => {
+    const dir = makeTmpConfig({});
+    try {
+      assert.equal(loadConfig(dir).settings.respect_agent_model, true);
+    } finally {
+      rmTmp(dir);
+    }
+  });
+
+  it('returns true when respect_agent_model is true', () => {
+    const dir = makeTmpConfig({ respect_agent_model: true });
+    try {
+      assert.equal(loadConfig(dir).settings.respect_agent_model, true);
+    } finally {
+      rmTmp(dir);
+    }
+  });
+
+  it('returns false when respect_agent_model is explicitly false', () => {
+    const dir = makeTmpConfig({ respect_agent_model: false });
+    try {
+      assert.equal(loadConfig(dir).settings.respect_agent_model, false);
+    } finally {
+      rmTmp(dir);
+    }
+  });
+});

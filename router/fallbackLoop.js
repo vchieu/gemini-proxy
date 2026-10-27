@@ -85,7 +85,11 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   const requestedModel = agentRequest && agentRequest.model;
   if (config && config.respect_agent_model && requestedModel && requestedModel !== 'auto') {
     const found = models.filter((m) => m.name === requestedModel);
-    if (found.length > 0) candidateModels = found;
+    if (found.length > 0) {
+      candidateModels = found;
+    } else {
+      logger.warn(`Model "${requestedModel}" không có trong models.json -> xoay tất cả model (dùng "auto" hoặc thêm vào config)`);
+    }
   }
 
   // Truyền cả body (không chỉ messages[]) để estimateTokens tính thêm JSON của `tools`
