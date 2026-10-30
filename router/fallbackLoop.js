@@ -43,6 +43,9 @@ const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 20000;
 // mà request sau không mất 10-60s thử lại nó.
 const MODEL_PENALTY_MS = 45000;
 
+// Tên model agent gửi được coi là "tự chọn/xoay" (không chỉ định model cụ thể).
+const AUTO_ALIASES = new Set(['auto', 'gemini-auto']);
+
 /**
  * HTTP 5xx THẬT từ upstream (Google trả !res.ok) — lỗi tạm thời, nên thử cặp khác.
  * Ngoài ra timeout do proxy tự sinh cũng là tạm thời: 504 kèm chữ "timeout"
@@ -81,14 +84,17 @@ async function withFallback(agentRequest, { models, keys, stateStore, config }, 
   );
   const mode = (config && config.upstream_mode) || 'openai_compat';
 
-  let candidateModels = models;
+  // Mặc định (auto / không chỉ định model): chỉ xoay các model có auto !== false.
+  let candidateModels = models.filter((m) => m.auto !== false);
+  if (candidateModels.length === 0) candidateModels = models; // tránh rỗng nếu mọi model đều auto:false
   const requestedModel = agentRequest && agentRequest.model;
-  if (config && config.respect_agent_model && requestedModel && requestedModel !== 'auto') {
+  if (config && config.respect_agent_model && requestedModel && !AUTO_ALIASES.has(requestedModel)) {
+    // Tìm trong TOÀN BỘ models để chọn đích danh được model auto:false (vd flash-lite).
     const found = models.filter((m) => m.name === requestedModel);
     if (found.length > 0) {
       candidateModels = found;
     } else {
-      logger.warn(`Model "${requestedModel}" không có trong models.json -> xoay tất cả model (dùng "auto" hoặc thêm vào config)`);
+      logger.warn(`Model "${requestedModel}" không có trong models.json -> xoay các model auto (dùng "auto" hoặc thêm vào config)`);
     }
   }
 

@@ -64,7 +64,11 @@ function loadConfig(configDir) {
         throw new Error(`models.json: models[${i}].limits.${f} must be a positive number`);
       }
     }
-    return { name: m.name, priority, limits };
+    if (m.auto !== undefined && typeof m.auto !== 'boolean') {
+      throw new Error(`models.json: models[${i}].auto must be a boolean`);
+    }
+    // auto:false -> chỉ được chọn khi agent chỉ định đích danh (không nằm trong vòng xoay "auto")
+    return { name: m.name, priority, auto: m.auto !== false, limits };
   });
   if (models.length === 0) throw new Error('models.json: at least one model is required');
   models.sort((a, b) => a.priority - b.priority);
